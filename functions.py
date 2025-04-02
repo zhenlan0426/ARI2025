@@ -46,6 +46,7 @@ def backwardTask(task,tpara):
     return [(backward(x,tpara), backward(y,tpara)) for x,y in task]
 def tokenize_task(task):
     """Tokenizes an ARC task into input/target sequences with special tokens."""
+    # TODO: for inference, last task only has x, it should be BOS_X | X | EOS_X | BOS_Y
     # Special token IDs
     BOS_X = 10
     EOS_X = 11
