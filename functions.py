@@ -6,16 +6,43 @@ import torch
 ''' dataset processing '''
 @dataclass
 class TransformPara:
-    fliplr: int
-    rot90: int
-    perm_color: np.ndarray
-    perm_example: np.ndarray
+    fliplr: int          # Flip left-right (0 or 1)
+    rot90: int           # Number of 90-degree rotations (0 to 3)
+    perm_color: np.ndarray  # Color permutation array
+    perm_example: np.ndarray  # Example permutation array
+    enlarge: tuple[int, int]  # Enlarge factors (n, m)
+    apply_to_output: int     # Apply transformations to y or not (except color)
+
+def enlarge_grid_n_times(grid, n, m):
+    if n == 1 and m == 1:
+        return grid
+    new_grid = []
+    for row in grid:
+        new_row = []
+        for element in row:
+            new_row += [element] * n
+        new_grid += [new_row] * m
+    return new_grid
+
+def shrink_grid_n_times(enlarged_grid, n, m):
+    if n == 1 and m == 1:
+        return enlarged_grid
+    original_height = len(enlarged_grid) // m
+    original_width = len(enlarged_grid[0]) // n if enlarged_grid else 0
+    original_grid = []
+    for i in range(original_height):
+        row = enlarged_grid[i * m]
+        original_row = [row[j * n] for j in range(original_width)]
+        original_grid.append(original_row)
+    return original_grid
 
 def generateTransformPara(n):
     """Randomly generates transformation parameters"""
     # n is the number of examples
-    # (fliplr, rot90, permutate color, permutate example)
-    return TransformPara(np.random.randint(0, 2), np.random.randint(0, 4), np.random.permutation(10), np.random.permutation(n))
+    # (fliplr, rot90, permutate color, permutate example, enlarge, apply to output)
+    return TransformPara(np.random.randint(0, 2), np.random.randint(0, 4), np.random.permutation(10), \
+                         np.random.permutation(n),(np.random.randint(1, 3), np.random.randint(1, 3)),\
+                         np.random.randint(0, 2))
 
 def forward(x, tpara:TransformPara):
     """Applies transformations to a single grid."""
@@ -23,10 +50,14 @@ def forward(x, tpara:TransformPara):
         x = np.fliplr(x)
     x = np.rot90(x, k=tpara.rot90)
     x = tpara.perm_color[x]
+    n, m = tpara.enlarge
+    x = enlarge_grid_n_times(x, n, m)
     return x
     
 def backward(x, tpara:TransformPara):
     """Reverses transformations for a single grid."""
+    n, m = tpara.enlarge
+    x = shrink_grid_n_times(x, n, m)
     inv_perm = np.argsort(tpara.perm_color)  # Compute inverse permutation
     x = inv_perm[x]
     x = np.rot90(x, k=4-tpara.rot90)
@@ -34,16 +65,27 @@ def backward(x, tpara:TransformPara):
         x = np.fliplr(x)
     return x
 
-def forwardTask(task,tpara):
-    """Applies transformation to list of [(x1,y1),...] examples."""
+def forwardTask(task, tpara: TransformPara):
+    """Applies transformations to a list of [(x1, y1), ...] examples."""
     task_out = []
     for i in tpara.perm_example:
-        x,y = task[i]
-        task_out.append((forward(x,tpara), forward(y,tpara)))
+        x, y = task[i]
+        # Always apply all transformations to x
+        x_transformed = forward(x, tpara)
+        
+        # Decide how to transform y based on apply_to_output
+        if tpara.apply_to_output:
+            y_transformed = forward(y, tpara)
+        else:
+            y_transformed = tpara.perm_color[y]
+        
+        task_out.append((x_transformed, y_transformed))
     return task_out
 
 def backwardTask(task,tpara):
-    return [(backward(x,tpara), backward(y,tpara)) for x,y in task]
+    pass
+    # return [(backward(x,tpara), backward(y,tpara)) for x,y in task]
+
 def tokenize_task(task):
     """Tokenizes an ARC task into input/target sequences with special tokens."""
     # TODO: for inference, last task only has x, it should be BOS_X | X | EOS_X | BOS_Y
@@ -64,7 +106,7 @@ def tokenize_task(task):
         input_tokens.append(BOS_X)
         target_tokens.append(PAD_TOKEN)
         
-        for row_idx, row in enumerate(x):
+        for row in x:
             # Add row elements
             input_tokens.extend(row)
             target_tokens.extend([PAD_TOKEN]*len(row))
@@ -79,7 +121,7 @@ def tokenize_task(task):
         input_tokens.append(BOS_Y)
         target_tokens.append(PAD_TOKEN)  # Mask BOS_Y
         
-        for row_idx, row in enumerate(y):
+        for row in y:
             # Add row elements
             input_tokens.extend(row)
             target_tokens.extend(row)  # Keep y values in target
