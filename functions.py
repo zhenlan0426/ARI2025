@@ -342,3 +342,86 @@ def create_arc_causal_attention_mask(*lengths):
     out = np.where(mask, 0, -np.inf)
     return torch.tensor(out[None][None], dtype=torch.bfloat16).to('cuda')
 
+
+
+def tokenize_arc_oneshot(input_grid, output_grid):
+    """
+    Tokenizes a single ARC example (input_grid, output_grid) into model input and target sequences.
+    Uses distinct placeholder tokens for predicting output rows, columns, and cells. output_grid 
+    is assumed to be independent of each other and predicted in one go.
+
+    Args:
+        example (tuple): A tuple containing (input_grid, output_grid), where each grid
+                         is a list of lists of integers (0-9).
+
+    Returns:
+        tuple: A tuple containing (model_input_tokens, model_target_tokens).
+               Returns (None, None) if validation fails.
+    """
+    # Token definitions with direct values
+    # 0-9: Grid cell values (digits)
+    BOS_X = 10       # Beginning of input grid
+    EOS_X = 11       # End of input grid
+    BOS_Y = 12       # Beginning of output grid
+    EOS_Y = 13       # End of output grid
+    PREDICT_ROW_Y = 14  # Placeholder for predicting output rows
+    PREDICT_COL_Y = 15  # Placeholder for predicting output columns
+    PREDICT_CELL_Y = 16  # Placeholder for predicting output cells
+    
+    # Dimension tokens (SIZE_1 to SIZE_30 map to 17 to 46)
+    SIZE_TOKEN_OFFSET = 17
+    MIN_DIM = 1
+
+    def get_grid_dimensions(grid):
+        num_rows = len(grid)
+        num_cols = len(grid[0])
+        flat_grid = [cell for row in grid for cell in row]    
+        return num_rows, num_cols, flat_grid
+
+    def get_dimension_token(dim_size):
+        """Gets the token ID for a given dimension size."""
+        return SIZE_TOKEN_OFFSET + dim_size - MIN_DIM
+
+    IGNORE_INDEX = -100
+    # --- Validate and Flatten Input Grid (X) ---
+    rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
+    row_token_x = get_dimension_token(rows_x)
+    col_token_x = get_dimension_token(cols_x)
+
+    # --- Validate and Flatten Output Grid (Y) ---
+    rows_y, cols_y, flat_y = get_grid_dimensions(output_grid)
+    row_token_y = get_dimension_token(rows_y) # Actual target token for rows_y
+    col_token_y = get_dimension_token(cols_y) # Actual target token for cols_y
+    num_output_cells = rows_y * cols_y
+
+    # --- Construct Model Input Sequence ---
+    model_input_tokens = []
+    model_input_tokens.append(BOS_X)
+    model_input_tokens.append(row_token_x)
+    model_input_tokens.append(col_token_x)
+    model_input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+    model_input_tokens.append(EOS_X)
+    model_input_tokens.append(BOS_Y)
+    # Append the specific prediction placeholder tokens
+    model_input_tokens.append(PREDICT_ROW_Y) # Placeholder for row_y prediction
+    model_input_tokens.append(PREDICT_COL_Y) # Placeholder for col_y prediction
+    model_input_tokens.extend([PREDICT_CELL_Y] * num_output_cells) # Placeholders for grid_y prediction
+    model_input_tokens.append(EOS_Y)
+
+    # --- Construct Model Target Sequence ---
+    # Target sequence structure remains the same, aligning with the input placeholders
+    model_target_tokens = []
+    # Ignore tokens corresponding to the input part (BOS_X to BOS_Y inclusive)
+    len_prefix_ignore = 1 + 1 + 1 + len(flat_x) + 1 + 1 # BOS_X, rX, cX, flat_X, EOS_X, BOS_Y
+    model_target_tokens.extend([IGNORE_INDEX] * len_prefix_ignore)
+    
+    # Target for PREDICT_ROW_Y placeholder
+    model_target_tokens.append(row_token_y)
+    # Target for PREDICT_COL_Y placeholder
+    model_target_tokens.append(col_token_y)
+    # Targets for PREDICT_CELL_Y placeholders
+    model_target_tokens.extend(flat_y) # Add actual flattened output grid cells
+    # Ignore the final EOS_Y token in the input sequence
+    model_target_tokens.append(IGNORE_INDEX)
+
+    return model_input_tokens, model_target_tokens
