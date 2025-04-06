@@ -87,7 +87,7 @@ def backwardTask(task,tpara):
     pass
     # return [(backward(x,tpara), backward(y,tpara)) for x,y in task]
 
-def tokenize_task(task):
+def tokenize_task(task, return_lengths=False):
     """Tokenizes an ARC task into input/target sequences with special tokens."""
     # TODO: for inference, last task only has x, it should be BOS_X | X | EOS_X | BOS_Y
     # Special token IDs
@@ -148,7 +148,10 @@ def tokenize_task(task):
     target_tokens = target_tokens[1:] + [PAD_TOKEN]
     
     # Convert to numpy arrays
-    return np.array(input_tokens), np.array(target_tokens), lengths
+    if return_lengths:
+        return np.array(input_tokens), np.array(target_tokens), lengths
+    else:
+        return np.array(input_tokens), np.array(target_tokens)
 
 def parse_generated_y(input_tokens):
     """Parses the last Y (generated) tokenized sequence and then coverts it to a 2D grid.    
@@ -189,19 +192,38 @@ def numpy2torch(x,max_length):
     x = torch.tensor(x[:max_length][None]).to('cuda')
     return x
 
-def data_gen(data, IsTrain, max_length):
+def data_gen(data, IsTrain, max_length, return_lengths=False):
+    """Generate data for training or testing.
+    
+    Args:
+        data: Dictionary containing 'train' and 'test' datasets
+        IsTrain: Boolean indicating whether to use training data
+        max_length: Maximum sequence length for truncation
+        return_lengths: Whether to return sequence lengths
+        
+    Yields:
+        Tokenized and processed examples as PyTorch tensors
+    """
+    # Select dataset split
+    dataset = data['train'] if IsTrain else data['test']
+    
+    # Shuffle training data
     if IsTrain:
-        data = data['train']
-        random.shuffle(data)
-        for task in data:
-            task = forwardTask(task,generateTransformPara(len(task)))
-            x,y,lengths = tokenize_task(task)
-            yield numpy2torch(x,max_length), numpy2torch(y,max_length), lengths
-    else:
-        data = data['test']
-        for task in data:
-            x,y,lengths = tokenize_task(task)
-            yield numpy2torch(x,max_length), numpy2torch(y,max_length), lengths
+        random.shuffle(dataset)
+    
+    for task in dataset:
+        # Apply transformations only during training
+        if IsTrain:
+            task = forwardTask(task, generateTransformPara(len(task)))
+        
+        # Tokenize the task
+        if return_lengths:
+            x, y, lengths = tokenize_task(task, return_lengths=True)
+            yield numpy2torch(x, max_length), numpy2torch(y, max_length), lengths
+        else:
+            x, y = tokenize_task(task)
+            yield numpy2torch(x, max_length), numpy2torch(y, max_length)
+
 
 def create_arc_attention_mask(*lengths):
     """
@@ -223,10 +245,6 @@ def create_arc_attention_mask(*lengths):
        This allows positional information to be processed via self-attention
        without leaking information between output tokens during generation.
     """
-    if not lengths:
-        return np.empty((0, 0), dtype=bool)
-    if len(lengths) % 2 != 0:
-        raise ValueError("Must provide an even number of lengths (pairs of x_len, y_len).")
 
     total_len = sum(lengths)
     # Initialize with False. We will selectively enable attention.
@@ -286,10 +304,7 @@ def create_arc_causal_attention_mask(*lengths):
     3. yi uses causal attention within its own block (like standard LLM),
        meaning each token can only attend to itself and previous tokens in the sequence.
     """
-    if not lengths:
-        return np.empty((0, 0), dtype=bool)
-    if len(lengths) % 2 != 0:
-        raise ValueError("Must provide an even number of lengths (pairs of x_len, y_len).")
+
 
     total_len = sum(lengths)
     # Initialize with False. We will selectively enable attention.
