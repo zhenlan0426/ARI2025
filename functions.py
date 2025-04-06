@@ -251,7 +251,7 @@ def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=toke
                 mask = create_arc_causal_attention_mask(*lengths)
             else:
                 mask = create_arc_attention_mask_oneshot(*lengths)
-            yield numpy2torch(x, max_length), numpy2torch(y, max_length), mask
+            yield numpy2torch(x, max_length), numpy2torch(y, max_length), torch.tensor(mask[:,:,:max_length,:max_length], dtype=torch.bfloat16).to('cuda')
         else:
             x, y = tokenize_func(task, return_lengths=False)
             yield numpy2torch(x, max_length), numpy2torch(y, max_length)
@@ -266,7 +266,8 @@ def create_arc_attention_mask_oneshot(*lengths):
                   (x1_len, y1_len, ..., xk_len, yk_len).
 
     Returns:
-        torch.Tensor: Attention mask with 0 for positions to attend to and -inf for masked positions.
+        numpy.ndarray: A 2D numpy array of shape (1, 1, total_len, total_len) containing attention mask values.
+                     Values are 0 for positions that can attend and -inf for masked positions.
 
     Rules applied:
     1. Xi attends fully to Xi (within-grid attention).
@@ -315,7 +316,7 @@ def create_arc_attention_mask_oneshot(*lengths):
     
     # Convert boolean mask to attention values (0 for attend, -inf for mask)
     out = np.where(mask, 0, -np.inf)
-    return torch.tensor(out[None][None], dtype=torch.bfloat16).to('cuda')
+    return out[None][None]
 
 def create_arc_causal_attention_mask(*lengths):
     """
@@ -326,7 +327,8 @@ def create_arc_causal_attention_mask(*lengths):
                   (x1_len, y1_len, ..., xk_len, yk_len).
 
     Returns:
-        torch.Tensor: Attention mask with 0 for positions to attend to and -inf for masked positions.
+        numpy.ndarray: A 2D numpy array of shape (total_len, total_len) containing attention mask values.
+                     Values are 0 for positions that can attend and -inf for masked positions.
 
     Rules applied:
     1. Xi attends fully to Xi (within-grid attention).
@@ -370,7 +372,7 @@ def create_arc_causal_attention_mask(*lengths):
     
     # Convert boolean mask to attention values (0 for attend, -inf for mask)
     out = np.where(mask, 0, -np.inf)
-    return torch.tensor(out[None][None], dtype=torch.bfloat16).to('cuda')
+    return out[None][None]
 
 def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], return_lengths:bool=True):
     """
