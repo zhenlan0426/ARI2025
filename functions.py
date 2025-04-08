@@ -264,6 +264,7 @@ def create_arc_attention_mask_oneshot(*lengths, X_attend2_history=False):
     Args:
         *lengths: Sequence of integers for segment lengths
                   (x1_len, y1_len, ..., xk_len, yk_len).
+        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
 
     Returns:
         numpy.ndarray: A 2D numpy array of shape (1, 1, total_len, total_len) containing attention mask values.
@@ -273,9 +274,8 @@ def create_arc_attention_mask_oneshot(*lengths, X_attend2_history=False):
     1. Xi attends fully to Xi (within-grid attention).
     2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1)
        AND its corresponding input Xi.
-    3. yi attends ONLY to itself within the yi block (diagonal is True),
-       NOT to other tokens within the same yi block (off-diagonal is False).
-       This means independent predictions, allowing for parallel decoding.
+    3. row attends to all preceding history, col attends to row in addtion to all preceding history
+       cell attends to row and col and all preceding history.  
     """
 
     total_len = sum(lengths)
@@ -311,11 +311,13 @@ def create_arc_attention_mask_oneshot(*lengths, X_attend2_history=False):
             # Rule 2: yi attends to all history up to and including Xi
             mask[start:end, 0:start] = True
 
-            # Rule 3: yi attends ONLY to itself within its own block
-            # We ensure the yi-yi block (mask[start:end, start:end])
-            # only has True values on the diagonal.
+            # diagonal attention for yi
             indices = np.arange(start, end)
             mask[indices, indices] = True # Allow self-attention
+
+            # all y_i attend to both row and column tokens, column token can attend to row token
+            mask[start:end, start] = True
+            mask[start+1:end, start+1] = True
     
     # Convert boolean mask to attention values (0 for attend, -inf for mask)
     out = np.where(mask, 0, -np.inf)
@@ -328,6 +330,7 @@ def create_arc_causal_attention_mask(*lengths, X_attend2_history=False):
     Args:
         *lengths: Sequence of integers for segment lengths
                   (x1_len, y1_len, ..., xk_len, yk_len).
+        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
 
     Returns:
         numpy.ndarray: A 2D numpy array of shape (total_len, total_len) containing attention mask values.
