@@ -219,7 +219,7 @@ def numpy2torch(x, max_length):
     return x
 
 def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_task, X_attend2_history=False):
-    """Generate data for training or testing...
+    """Generate data for training or testing.
     
     Args:
         data: Dictionary containing 'train' and 'test' datasets
