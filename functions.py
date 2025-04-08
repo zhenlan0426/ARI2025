@@ -257,7 +257,7 @@ def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=toke
             yield numpy2torch(x, max_length), numpy2torch(y, max_length)
 
 
-def create_arc_attention_mask_oneshot(*lengths):
+def create_arc_attention_mask_oneshot(*lengths, X_attend2_history=False):
     """
     Creates a custom attention mask for ARC examples with parallel decoding.
 
@@ -300,7 +300,10 @@ def create_arc_attention_mask_oneshot(*lengths):
 
         if segment_type == 'X':
             # Rule 1: Xi attends fully to itself (intra-X attention)
-            mask[start:end, start:end] = True
+            if X_attend2_history:
+                mask[start:end, 0:start] = True
+            else:
+                mask[start:end, start:end] = True
             # Optional: Allow X to attend to prior history if needed
             # mask[start:end, 0:start] = True
 
@@ -318,7 +321,7 @@ def create_arc_attention_mask_oneshot(*lengths):
     out = np.where(mask, 0, -np.inf)
     return out[None][None]
 
-def create_arc_causal_attention_mask(*lengths):
+def create_arc_causal_attention_mask(*lengths, X_attend2_history=False):
     """
     Creates a custom attention mask for ARC examples with causal attention for Y segments.
 
@@ -359,7 +362,10 @@ def create_arc_causal_attention_mask(*lengths):
 
         if segment_type == 'X':
             # Rule 1: Xi attends fully to itself (intra-X attention)
-            mask[start:end, start:end] = True
+            if X_attend2_history:
+                mask[start:end, 0:start] = True
+            else:
+                mask[start:end, start:end] = True
             
         elif segment_type == 'Y':
             # Rule 2: yi attends to all history up to and including Xi
@@ -401,8 +407,7 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
     PREDICT_CELL_Y = 16  # Placeholder for predicting output cells
     
     # Dimension tokens (SIZE_1 to SIZE_30 map to 17 to 46)
-    SIZE_TOKEN_OFFSET = 17
-    MIN_DIM = 1
+    SIZE_TOKEN_OFFSET = 16
 
     def get_grid_dimensions(grid):
         """Extract dimensions and flatten a grid."""
@@ -413,7 +418,7 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
 
     def get_dimension_token(dim_size):
         """Gets the token ID for a given dimension size."""
-        return SIZE_TOKEN_OFFSET + dim_size - MIN_DIM
+        return SIZE_TOKEN_OFFSET + dim_size
 
     IGNORE_INDEX = -100
     input_tokens = []
@@ -442,7 +447,7 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
         model_input_tokens.append(BOS_Y)
         
         if return_lengths: # include BOS_Y as each prediction y needs to attend to BOS_Y
-            len_x = len(model_input_tokens)    
+            len_x = len(model_input_tokens)
             
         # Append the specific prediction placeholder tokens
         model_input_tokens.append(PREDICT_ROW_Y) # Placeholder for row_y prediction
