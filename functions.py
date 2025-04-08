@@ -218,7 +218,7 @@ def numpy2torch(x, max_length):
     x = torch.tensor(x[:max_length][None]).to('cuda')
     return x
 
-def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_task):
+def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_task, X_attend2_history=False):
     """Generate data for training or testing.
     
     Args:
@@ -227,6 +227,7 @@ def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=toke
         max_length: Maximum sequence length for truncation
         return_lengths: Whether to return sequence lengths
         tokenize_func: Function to use for tokenization
+        X_attend2_history: Whether to allow X segments to attend to previous segments
         
     Yields:
         Tokenized input, target, and optionally attention mask
@@ -248,9 +249,9 @@ def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=toke
             x, y, lengths = tokenize_func(task, return_lengths=True)
             # Create appropriate attention mask based on tokenization function
             if tokenize_func is tokenize_task:
-                mask = create_arc_causal_attention_mask(*lengths)
+                mask = create_arc_causal_attention_mask(*lengths, X_attend2_history=X_attend2_history)
             else:
-                mask = create_arc_attention_mask_oneshot(*lengths)
+                mask = create_arc_attention_mask_oneshot(*lengths, X_attend2_history=X_attend2_history)
             yield numpy2torch(x, max_length), numpy2torch(y, max_length), torch.tensor(mask[:,:,:max_length,:max_length], dtype=torch.bfloat16).to('cuda')
         else:
             x, y = tokenize_func(task, return_lengths=False)
@@ -275,7 +276,7 @@ def create_arc_attention_mask_oneshot(*lengths, X_attend2_history=False):
     2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1)
        AND its corresponding input Xi.
     3. row attends to all preceding history, col attends to row in addtion to all preceding history
-       cell attends to row and col and all preceding history.  
+       cell attends to row and col and all preceding history...  
     """
 
     total_len = sum(lengths)
