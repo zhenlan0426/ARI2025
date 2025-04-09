@@ -375,7 +375,6 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], max
     target_tokens = []
 
     n_task = find_first_exceed(task, max_length)
-    print(n_task)
     for input_grid, output_grid in task[:n_task-1]:
         # --- Validate and Flatten Input Grid (X) ---
         rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
