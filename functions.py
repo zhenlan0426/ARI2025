@@ -93,7 +93,131 @@ def backwardTask(task, tpara):
     # return [(backward(x, tpara), backward(y, tpara)) for x, y in task]
     pass
 
-def tokenize_task(task, return_lengths=False):
+def numpy2torch(x, max_length):
+    """Convert numpy array to torch tensor and move to GPU, with length truncation."""
+    x = torch.tensor(x[:max_length][None]).to('cuda')
+    return x
+
+def oneshot_mask(*lengths, X_attend2_history=False):
+    """
+    Creates a custom attention mask for ARC examples with parallel decoding.
+
+    Args:
+        *lengths: Sequence of integers for segment lengths
+                  (x1_len, y1_len, ..., xk_len, yk_len).
+        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
+
+    Returns:
+        numpy.ndarray: A 2D numpy array of shape (1, 1, total_len, total_len) containing attention mask values.
+                     Values are 0 for positions that can attend and -inf for masked positions.
+
+    Rules applied:
+    1. Xi attends fully to Xi (within-grid attention).
+    2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1)
+       AND its corresponding input Xi.
+    3. row attends to all preceding history, col attends to row in addtion to all preceding history
+       cell attends to row and col and all preceding history...  
+    """
+
+    total_len = sum(lengths)
+    # Initialize with False. We will selectively enable attention.
+    mask = np.full((total_len, total_len), False, dtype=bool)
+
+    segments = []
+    current_idx = 0
+    is_x_segment = True
+    for length in lengths:
+        start = current_idx
+        end = current_idx + length
+        segment_type = 'X' if is_x_segment else 'Y'
+        segments.append({'start': start, 'end': end, 'type': segment_type, 'len': length})
+        current_idx += length
+        is_x_segment = not is_x_segment
+
+    # Apply attention rules segment by segment
+    for segment in segments:
+        start, end = segment['start'], segment['end']
+        segment_type = segment['type']
+
+        if segment_type == 'X':
+            # Rule 1: Xi attends fully to itself (intra-X attention)
+            if X_attend2_history:
+                mask[start:end, 0:start] = True
+            else:
+                mask[start:end, start:end] = True
+            # Optional: Allow X to attend to prior history if needed
+            # mask[start:end, 0:start] = True
+
+        elif segment_type == 'Y':
+            # Rule 2: yi attends to all history up to and including Xi
+            mask[start:end, 0:start] = True
+
+            # diagonal attention for yi
+            indices = np.arange(start, end)
+            mask[indices, indices] = True # Allow self-attention
+
+            # all y_i attend to both row and column tokens, column token can attend to row token
+            mask[start:end, start] = True
+            mask[start+1:end, start+1] = True
+    
+    # Convert boolean mask to attention values (0 for attend, -inf for mask)
+    out = np.where(mask, 0, -np.inf)
+    return out[None][None]
+
+def causal_mask(*lengths, X_attend2_history=False):
+    """
+    Creates a custom attention mask for ARC examples with causal attention for Y segments.
+
+    Args:
+        *lengths: Sequence of integers for segment lengths
+                  (x1_len, y1_len, ..., xk_len, yk_len).
+        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
+
+    Returns:
+        numpy.ndarray: A 2D numpy array of shape (total_len, total_len) containing attention mask values.
+                     Values are 0 for positions that can attend and -inf for masked positions.
+
+    Rules applied:
+    1. Xi attends fully to Xi (within-grid attention).
+    2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1, Xi)
+       AND within its segment previous yi-1, yi-2, ... 
+    """
+    total_len = sum(lengths)
+    # Initialize with False. We will selectively enable attention.
+    mask = np.full((total_len, total_len), False, dtype=bool)
+
+    segments = []
+    current_idx = 0
+    is_x_segment = True
+    for length in lengths:
+        start = current_idx
+        end = current_idx + length
+        segment_type = 'X' if is_x_segment else 'Y'
+        segments.append({'start': start, 'end': end, 'type': segment_type, 'len': length})
+        current_idx += length
+        is_x_segment = not is_x_segment
+
+    # Apply attention rules segment by segment
+    for segment in segments:
+        start, end = segment['start'], segment['end']
+        segment_type = segment['type']
+
+        if segment_type == 'X':
+            if X_attend2_history: # Xi attends to all previous segments
+                mask[start:end, 0:start] = True
+            else: # Xi attends only to its segment (intra-X attention)
+                mask[start:end, start:end] = True
+            
+        elif segment_type == 'Y':
+            # Each token can attend to itself and all previous tokens
+            for i in range(start, end):
+                mask[i, 0:i+1] = True  # Causal attention pattern
+    
+    # Convert boolean mask to attention values (0 for attend, -inf for mask)
+    out = np.where(mask, 0, -np.inf)
+    return out[None][None]
+
+def tokenize_causal(task, return_lengths=False):
     """Tokenizes an ARC task into input/target sequences with special tokens.
     
     Args:
@@ -168,221 +292,9 @@ def tokenize_task(task, return_lengths=False):
     else:
         return np.array(input_tokens), np.array(target_tokens)
 
-def parse_generated_y(input_tokens):
-    """Parses the last Y (generated) tokenized sequence and converts it to a 2D grid.
-    
-    Args:
-        input_tokens: List/array of tokens containing full sequence
-    
-    Returns:
-        2D numpy array of the last generated Y grid
-    """
-    # Special token IDs
-    BOS_Y = 13
-    EOS_Y = 14
-    LINE_BREAK = 12
-
-    # Find last BOS_Y
-    last_bos = max(i for i, t in enumerate(input_tokens) if t == BOS_Y)
-
-    # Extract Y sequence between BOS_Y and end (or EOS_Y if present)
-    y_tokens = input_tokens[last_bos+1:-1]  # Exclude BOS_Y and last token
-
-    # Split into rows using line breaks
-    rows = []
-    current_row = []
-    for t in y_tokens:
-        if t == LINE_BREAK:
-            if current_row:  # Skip empty rows from trailing line breaks
-                rows.append(current_row)
-                current_row = []
-        elif t != EOS_Y:  # Skip EOS_Y if present
-            current_row.append(t)
-    
-    # Add the last row if it's not empty and wasn't terminated by a line break
-    if current_row:
-        rows.append(current_row)
-        
-    # Validate the grid
-    if not rows:
-        return []
-    
-    # Check that all rows have the same length
-    row_lengths = set(len(row) for row in rows)
-    assert len(row_lengths) == 1, f"Invalid 2D grid: rows have different lengths {row_lengths}"
-    
-    return rows
-
-def numpy2torch(x, max_length):
-    """Convert numpy array to torch tensor and move to GPU, with length truncation."""
-    x = torch.tensor(x[:max_length][None]).to('cuda')
-    return x
-
-def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_task, X_attend2_history=False):
-    """Generate data for training or testing.
-    
-    Args:
-        data: Dictionary containing 'train' and 'test' datasets
-        IsTrain: Boolean indicating whether to use training data
-        max_length: Maximum sequence length for truncation
-        return_lengths: Whether to return sequence lengths
-        tokenize_func: Function to use for tokenization
-        X_attend2_history: Whether to allow X segments to attend to previous segments
-        
-    Yields:
-        Tokenized input, target, and optionally attention mask
-    """
-    # Select dataset split
-    dataset = data['train'] if IsTrain else data['test']
-    
-    # Shuffle training data
-    if IsTrain:
-        random.shuffle(dataset)
-    
-    for task in dataset:
-        # Apply transformations only during training
-        if IsTrain:
-            task = forwardTask(task, generateTransformPara(len(task)))
-        
-        # Tokenize the task
-        if return_lengths:
-            x, y, lengths = tokenize_func(task, return_lengths=True)
-            # Create appropriate attention mask based on tokenization function
-            if tokenize_func is tokenize_task:
-                mask = create_arc_causal_attention_mask(*lengths, X_attend2_history=X_attend2_history)
-            else:
-                mask = create_arc_attention_mask_oneshot(*lengths, X_attend2_history=X_attend2_history)
-            yield numpy2torch(x, max_length), numpy2torch(y, max_length), torch.tensor(mask[:,:,:max_length,:max_length], dtype=torch.bfloat16).to('cuda')
-        else:
-            x, y = tokenize_func(task, return_lengths=False)
-            yield numpy2torch(x, max_length), numpy2torch(y, max_length)
-
-
-def create_arc_attention_mask_oneshot(*lengths, X_attend2_history=False):
-    """
-    Creates a custom attention mask for ARC examples with parallel decoding.
-
-    Args:
-        *lengths: Sequence of integers for segment lengths
-                  (x1_len, y1_len, ..., xk_len, yk_len).
-        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
-
-    Returns:
-        numpy.ndarray: A 2D numpy array of shape (1, 1, total_len, total_len) containing attention mask values.
-                     Values are 0 for positions that can attend and -inf for masked positions.
-
-    Rules applied:
-    1. Xi attends fully to Xi (within-grid attention).
-    2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1)
-       AND its corresponding input Xi.
-    3. row attends to all preceding history, col attends to row in addtion to all preceding history
-       cell attends to row and col and all preceding history...  
-    """
-
-    total_len = sum(lengths)
-    # Initialize with False. We will selectively enable attention.
-    mask = np.full((total_len, total_len), False, dtype=bool)
-
-    segments = []
-    current_idx = 0
-    is_x_segment = True
-    for length in lengths:
-        start = current_idx
-        end = current_idx + length
-        segment_type = 'X' if is_x_segment else 'Y'
-        segments.append({'start': start, 'end': end, 'type': segment_type, 'len': length})
-        current_idx += length
-        is_x_segment = not is_x_segment
-
-    # Apply attention rules segment by segment
-    for segment in segments:
-        start, end = segment['start'], segment['end']
-        segment_type = segment['type']
-
-        if segment_type == 'X':
-            # Rule 1: Xi attends fully to itself (intra-X attention)
-            if X_attend2_history:
-                mask[start:end, 0:start] = True
-            else:
-                mask[start:end, start:end] = True
-            # Optional: Allow X to attend to prior history if needed
-            # mask[start:end, 0:start] = True
-
-        elif segment_type == 'Y':
-            # Rule 2: yi attends to all history up to and including Xi
-            mask[start:end, 0:start] = True
-
-            # diagonal attention for yi
-            indices = np.arange(start, end)
-            mask[indices, indices] = True # Allow self-attention
-
-            # all y_i attend to both row and column tokens, column token can attend to row token
-            mask[start:end, start] = True
-            mask[start+1:end, start+1] = True
-    
-    # Convert boolean mask to attention values (0 for attend, -inf for mask)
-    out = np.where(mask, 0, -np.inf)
-    return out[None][None]
-
-def create_arc_causal_attention_mask(*lengths, X_attend2_history=False):
-    """
-    Creates a custom attention mask for ARC examples with causal attention for Y segments.
-
-    Args:
-        *lengths: Sequence of integers for segment lengths
-                  (x1_len, y1_len, ..., xk_len, yk_len).
-        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
-
-    Returns:
-        numpy.ndarray: A 2D numpy array of shape (total_len, total_len) containing attention mask values.
-                     Values are 0 for positions that can attend and -inf for masked positions.
-
-    Rules applied:
-    1. Xi attends fully to Xi (within-grid attention).
-    2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1)
-       AND its corresponding input Xi.
-    3. yi uses causal attention within its own block (like standard LLM),
-       meaning each token can only attend to itself and previous tokens in the sequence.
-    """
-    total_len = sum(lengths)
-    # Initialize with False. We will selectively enable attention.
-    mask = np.full((total_len, total_len), False, dtype=bool)
-
-    segments = []
-    current_idx = 0
-    is_x_segment = True
-    for length in lengths:
-        start = current_idx
-        end = current_idx + length
-        segment_type = 'X' if is_x_segment else 'Y'
-        segments.append({'start': start, 'end': end, 'type': segment_type, 'len': length})
-        current_idx += length
-        is_x_segment = not is_x_segment
-
-    # Apply attention rules segment by segment
-    for segment in segments:
-        start, end = segment['start'], segment['end']
-        segment_type = segment['type']
-
-        if segment_type == 'X':
-            # Rule 1: Xi attends fully to itself (intra-X attention)
-            if X_attend2_history:
-                mask[start:end, 0:start] = True
-            else:
-                mask[start:end, start:end] = True
-            
-        elif segment_type == 'Y':
-            # Rule 2: yi attends to all history up to and including Xi
-            mask[start:end, 0:start] = True
-
-            # Rule 3: yi uses causal attention within its own block
-            # Each token can attend to itself and previous tokens
-            for i in range(start, end):
-                mask[i, start:i+1] = True  # Causal attention pattern
-    
-    # Convert boolean mask to attention values (0 for attend, -inf for mask)
-    out = np.where(mask, 0, -np.inf)
-    return out[None][None]
+def parse_causal_y(input_tokens):
+    # TODO: Implement this
+    pass
 
 def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], return_lengths:bool=True):
     """
@@ -406,8 +318,8 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
     EOS_X = 11       # End of input grid
     BOS_Y = 12       # Beginning of output grid
     EOS_Y = 13       # End of output grid
-    PREDICT_ROW_Y = 14  # Placeholder for predicting output rows
-    PREDICT_COL_Y = 15  # Placeholder for predicting output columns
+    # PREDICT_ROW_Y = 14  # no longer used
+    # PREDICT_COL_Y = 15  # no longer used
     PREDICT_CELL_Y = 16  # Placeholder for predicting output cells
     
     # Dimension tokens (SIZE_1 to SIZE_30 map to 17 to 46)
@@ -454,8 +366,8 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
             len_x = len(model_input_tokens)
             
         # Append the specific prediction placeholder tokens
-        model_input_tokens.append(PREDICT_ROW_Y) # Placeholder for row_y prediction
-        model_input_tokens.append(PREDICT_COL_Y) # Placeholder for col_y prediction
+        model_input_tokens.append(row_token_y)
+        model_input_tokens.append(col_token_y)
         model_input_tokens.extend([PREDICT_CELL_Y] * num_output_cells) # Placeholders for grid_y prediction
         model_input_tokens.append(EOS_Y)
         
@@ -468,13 +380,15 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
         # Target sequence structure remains the same, aligning with the input placeholders
         model_target_tokens = []
         # Ignore tokens corresponding to the input part (BOS_X to BOS_Y inclusive)
-        len_prefix_ignore = 1 + 1 + 1 + len(flat_x) + 1 + 1 # BOS_X, rX, cX, flat_X, EOS_X, BOS_Y
+        len_prefix_ignore = 1 + 1 + 1 + len(flat_x) + 1 # BOS_X, rX, cX, flat_X, EOS_X
         model_target_tokens.extend([IGNORE_INDEX] * len_prefix_ignore)
         
-        # Target for PREDICT_ROW_Y placeholder
+        # Target for BOS_Y
         model_target_tokens.append(row_token_y)
-        # Target for PREDICT_COL_Y placeholder
+        # Target for row_token_y
         model_target_tokens.append(col_token_y)
+        # Target for col_token_y
+        model_target_tokens.append(IGNORE_INDEX)
         # Targets for PREDICT_CELL_Y placeholders
         model_target_tokens.extend(flat_y) # Add actual flattened output grid cells
         # Ignore the final EOS_Y token in the input sequence
@@ -490,3 +404,40 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
         return np.array(input_tokens), np.array(target_tokens), lengths
     else:
         return np.array(input_tokens), np.array(target_tokens)
+
+def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_causal, mask_func=causal_mask, X_attend2_history=False):
+    """Generate data for training or testing.
+    
+    Args:
+        data: Dictionary containing 'train' and 'test' datasets
+        IsTrain: Boolean indicating whether to use training data
+        max_length: Maximum sequence length for truncation
+        return_lengths: Whether to return sequence lengths
+        tokenize_func: Function to use for tokenization
+        mask_func: Function to use for creating attention masks
+        X_attend2_history: Whether to allow X segments to attend to previous segments
+        
+    Yields:
+        Tokenized input, target, and optionally attention mask
+    """
+    # Select dataset split
+    dataset = data['train'] if IsTrain else data['test']
+    
+    # Shuffle training data
+    if IsTrain:
+        random.shuffle(dataset)
+    
+    for task in dataset:
+        # Apply transformations only during training
+        if IsTrain:
+            task = forwardTask(task, generateTransformPara(len(task)))
+        
+        # Tokenize the task
+        if return_lengths:
+            x, y, lengths = tokenize_func(task, return_lengths=True)
+            # Create appropriate attention mask based on tokenization function
+            mask = mask_func(*lengths, X_attend2_history=X_attend2_history)
+            yield numpy2torch(x, max_length), numpy2torch(y, max_length), torch.tensor(mask[:,:,:max_length,:max_length], dtype=torch.bfloat16).to('cuda')
+        else:
+            x, y = tokenize_func(task, return_lengths=False)
+            yield numpy2torch(x, max_length), numpy2torch(y, max_length)
