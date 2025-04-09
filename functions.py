@@ -216,7 +216,19 @@ def causal_mask(*lengths, X_attend2_history=False):
     # Convert boolean mask to attention values (0 for attend, -inf for mask)
     out = np.where(mask, 0, -np.inf)
     return out[None][None]
-    
+
+def find_first_exceed(task, max_len, extra_tokens=4):
+    # 4 for BOS_X, row, col, EOS_X in addtion to elements in input or output
+    # return the first task index that exceeds max_len, task[index-1] is the last task
+    total = 0
+    for i, (input_i, output_i) in enumerate(task, start=1):
+        size_input = len(input_i) * len(input_i[0])
+        size_output = len(output_i) * len(output_i[0])
+        total += size_input + size_output + extra_tokens * 2
+        if total > max_len:
+            return i
+    return len(task)  # If total never exceeds max_len
+
 def tokenize_causal(task, return_lengths=False, IsDecode=False):
     """
     Tokenizes autoregressively.
@@ -317,21 +329,22 @@ def parse_causal_y(input_tokens):
     # TODO: Implement this
     pass
 
-def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], return_lengths:bool=True):
+def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], max_length:int):
     """
-    Tokenizes a single ARC task into model input and target sequences.
-    Uses distinct placeholder tokens for predicting output rows, columns, and cells.
+    Tokenizes one-shot prediction.
+    Uses distinct placeholder tokens for predicting output cells.
     
     Args:
         task (list): A list of tuples, each containing (input_grid, output_grid), where each grid
                      is a list of lists of integers (0-9).
-        return_lengths (bool): Whether to return sequence lengths
+        max_length (int): Maximum sequence length to consider for tokenization.
         
     Returns:
         Tuple of:
             - numpy array of input tokens
             - numpy array of target tokens
-            - list of lengths [x1_len, y1_len, ...] (if return_lengths=True)
+            - integer indicating the length of input tokens before the final output grid,
+               where full attention can be applied
     """
     # Token definitions with direct values
     # 0-9: Grid cell values (digits)
@@ -360,9 +373,10 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
     IGNORE_INDEX = -100
     input_tokens = []
     target_tokens = []
-    lengths = []  # To store lengths of each x and y sequence
-    
-    for input_grid, output_grid in task:
+
+    n_task = find_first_exceed(task, max_length)
+    print(n_task)
+    for input_grid, output_grid in task[:n_task-1]:
         # --- Validate and Flatten Input Grid (X) ---
         rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
         row_token_x = get_dimension_token(rows_x)
@@ -374,57 +388,57 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
         col_token_y = get_dimension_token(cols_y) # Actual target token for cols_y
         num_output_cells = rows_y * cols_y
 
-        # --- Construct Model Input Sequence ---
-        model_input_tokens = []
-        model_input_tokens.append(BOS_X)
-        model_input_tokens.append(row_token_x)
-        model_input_tokens.append(col_token_x)
-        model_input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
-        model_input_tokens.append(EOS_X)
-        model_input_tokens.append(BOS_Y)
+        # --- Construct Model input Sequence ---
+        # append the input grid
+        len_input = len(input_tokens)
+        input_tokens.append(BOS_X)
+        input_tokens.append(row_token_x)
+        input_tokens.append(col_token_x)
+        input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+        input_tokens.append(EOS_X)
         
-        if return_lengths: # include BOS_Y as each prediction y needs to attend to BOS_Y
-            len_x = len(model_input_tokens)
-            
-        # Append the specific prediction placeholder tokens
-        model_input_tokens.append(row_token_y)
-        model_input_tokens.append(col_token_y)
-        model_input_tokens.extend([PREDICT_CELL_Y] * num_output_cells) # Placeholders for grid_y prediction
-        model_input_tokens.append(EOS_Y)
+        # append the output grid
+        input_tokens.append(BOS_Y)
+        input_tokens.append(row_token_y)
+        input_tokens.append(col_token_y)
+        input_tokens.extend(flat_y)
+        input_tokens.append(EOS_Y)
         
-        if return_lengths:
-            len_y = len(model_input_tokens) - len_x
-            
-        input_tokens.extend(model_input_tokens)
-        
-        # --- Construct Model Target Sequence ---
-        # Target sequence structure remains the same, aligning with the input placeholders
-        model_target_tokens = []
-        # Ignore tokens corresponding to the input part (BOS_X to BOS_Y inclusive)
-        len_prefix_ignore = 1 + 1 + 1 + len(flat_x) + 1 # BOS_X, rX, cX, flat_X, EOS_X
-        model_target_tokens.extend([IGNORE_INDEX] * len_prefix_ignore)
-        
-        # Target for BOS_Y
-        model_target_tokens.append(row_token_y)
-        # Target for row_token_y
-        model_target_tokens.append(col_token_y)
-        # Target for col_token_y
-        model_target_tokens.append(IGNORE_INDEX)
-        # Targets for PREDICT_CELL_Y placeholders
-        model_target_tokens.extend(flat_y) # Add actual flattened output grid cells
-        # Ignore the final EOS_Y token in the input sequence
-        model_target_tokens.append(IGNORE_INDEX)
-        
-        target_tokens.extend(model_target_tokens)
-        
-        if return_lengths:
-            lengths.append(len_x)
-            lengths.append(len_y)
+        # --- Construct Model Target Sequence ---        
+        target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
 
-    if return_lengths:
-        return np.array(input_tokens), np.array(target_tokens), lengths
-    else:
-        return np.array(input_tokens), np.array(target_tokens)
+    # --- Construct Model Input and Target Sequence for the last task ---
+    input_grid, output_grid = task[n_task-1]
+    rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
+    row_token_x = get_dimension_token(rows_x)
+    col_token_x = get_dimension_token(cols_x)
+    rows_y, cols_y, flat_y = get_grid_dimensions(output_grid)
+    row_token_y = get_dimension_token(rows_y)
+    col_token_y = get_dimension_token(cols_y)
+    # append the input grid, same as before
+    len_input = len(input_tokens)
+    input_tokens.append(BOS_X)
+    input_tokens.append(row_token_x)
+    input_tokens.append(col_token_x)
+    input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+    input_tokens.append(EOS_X)
+    target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
+    len_input = len(input_tokens)
+
+    # append the output grid
+    input_tokens.append(BOS_Y)
+    target_tokens.append(row_token_y)
+
+    input_tokens.append(row_token_y)
+    target_tokens.append(col_token_y)
+
+    input_tokens.append(col_token_y)
+    target_tokens.append(IGNORE_INDEX)
+
+    input_tokens.extend([PREDICT_CELL_Y] * (rows_y * cols_y))
+    target_tokens.extend(flat_y)
+    
+    return np.array(input_tokens), np.array(target_tokens), len_input
 
 def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_causal,\
              mask_func=causal_mask, X_attend2_history=False, IsDecode=False):
