@@ -336,8 +336,8 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], max
     
     Args:
         task (list): A list of tuples, each containing (input_grid, output_grid), where each grid
-                     is a list of lists of integers (0-9).
-        max_length (int): Maximum sequence length to consider for tokenization.
+                     is a list of lists of integers (0-9)
+        max_length (int): Maximum sequence length to consider for tokenization
         
     Returns:
         Tuple of:
