@@ -217,7 +217,7 @@ def causal_mask(*lengths, X_attend2_history=False):
     out = np.where(mask, 0, -np.inf)
     return out[None][None]
 
-def tokenize_causal(task, return_lengths=False):
+def tokenize_causal_old(task, return_lengths=False):
     """Tokenizes an ARC task into input/target sequences with special tokens.
     
     Args:
@@ -291,6 +291,102 @@ def tokenize_causal(task, return_lengths=False):
         return np.array(input_tokens), np.array(target_tokens), lengths
     else:
         return np.array(input_tokens), np.array(target_tokens)
+    
+def tokenize_causal(task, return_lengths=False, IsDecode=False):
+    """
+    Tokenizes autoregressively.
+
+    Args:
+        task: List of (input_grid, output_grid) tuples.
+              For decoding, the last output_grid can be None.
+        return_lengths: Whether to return sequence lengths for each x and y segment.
+        IsDecode: if using the model for decoding or training.
+
+    Returns:
+        input_tokens: Numpy array of input token IDs.
+                      For training: (x1, y1, x2, y2, ... xN, yN)
+                      For decoding: (x1, y1, x2, y2, ..., xN, BOS_Y)
+        final_target: Depends on IsDecode.
+                      For training: Numpy array of shifted target token IDs.
+                      For decoding: The raw 2d grid (yN) or None.
+        lengths (optional): List of sequence lengths corresponding to segments
+                           added to input_tokens.
+    """
+    # Special token IDs
+    BOS_X = 10  # Beginning of input grid
+    EOS_X = 11  # End of input grid
+    LINE_BREAK = 12  # Row separator
+    BOS_Y = 13  # Beginning of output grid
+    EOS_Y = 14  # End of output grid
+    PAD_TOKEN = -100  # Padding/ignored token
+
+    input_tokens = []
+    target_tokens = []
+    lengths = []  # To store lengths of each x and y sequence
+    
+    n = len(task)
+    for i, (x, y) in enumerate(task):
+        IsLast = (i == n-1) and IsDecode
+        # Process input grid (x)
+        x_start_idx = len(input_tokens)
+        
+        input_tokens.append(BOS_X)
+        if not IsDecode:
+            target_tokens.append(PAD_TOKEN)
+        
+        for row in x:
+            # Add row elements
+            input_tokens.extend(row)
+            if not IsDecode:
+                target_tokens.extend([PAD_TOKEN]*len(row))
+
+            input_tokens.append(LINE_BREAK)
+            if not IsDecode:
+                target_tokens.append(PAD_TOKEN)
+
+        input_tokens.append(EOS_X)
+        if not IsDecode:
+            target_tokens.append(PAD_TOKEN)
+        
+        x_len = len(input_tokens) - x_start_idx  # Length including special tokens
+
+        # Process output grid (y)
+        y_start_idx = len(input_tokens)
+        
+        input_tokens.append(BOS_Y)
+        if not IsDecode:
+            target_tokens.append(PAD_TOKEN)  # Mask BOS_Y
+        
+        lengths.append(x_len)
+        if not IsLast:
+            for row in y:
+                # Add row elements
+                input_tokens.extend(row)
+                if not IsDecode:
+                    target_tokens.extend(row)  # Keep y values in target
+        
+                input_tokens.append(LINE_BREAK)
+                if not IsDecode:
+                    target_tokens.append(LINE_BREAK)
+
+            input_tokens.append(EOS_Y)
+            if not IsDecode:
+                target_tokens.append(EOS_Y)  # Include EOS_Y in target
+        
+            y_len = len(input_tokens) - y_start_idx  # Length including special tokens
+            lengths.append(y_len)
+        else:
+            target_tokens = y        
+        
+    # Create shifted targets (for next-token prediction)
+    if not IsDecode:
+        target_tokens = target_tokens[1:] + [PAD_TOKEN]
+    
+    # Convert to numpy arrays
+    if return_lengths:
+        return np.array(input_tokens), np.array(target_tokens) if target_tokens else None, lengths
+    else:
+        return np.array(input_tokens), np.array(target_tokens) if target_tokens else None
 
 def parse_causal_y(input_tokens):
     # TODO: Implement this
@@ -405,7 +501,8 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], ret
     else:
         return np.array(input_tokens), np.array(target_tokens)
 
-def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_causal, mask_func=causal_mask, X_attend2_history=False):
+def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_causal,\
+             mask_func=causal_mask, X_attend2_history=False, IsDecode=False):
     """Generate data for training or testing.
     
     Args:
@@ -416,7 +513,9 @@ def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=toke
         tokenize_func: Function to use for tokenization
         mask_func: Function to use for creating attention masks
         X_attend2_history: Whether to allow X segments to attend to previous segments
-        
+        IsDecode: when true, return the decoded input (x1,y1,x2,y2,...xk), 
+        target for yk (if yk present, i.e. local run instead of leaderboard run)
+            else return None for target
     Yields:
         Tokenized input, target, and optionally attention mask
     """
@@ -430,14 +529,15 @@ def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=toke
     for task in dataset:
         # Apply transformations only during training
         if IsTrain:
+            # TODO: tansformation for decode
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
         if return_lengths:
-            x, y, lengths = tokenize_func(task, return_lengths=True)
+            x, y, lengths = tokenize_func(task, return_lengths=True, IsDecode=IsDecode)
             # Create appropriate attention mask based on tokenization function
             mask = mask_func(*lengths, X_attend2_history=X_attend2_history)
             yield numpy2torch(x, max_length), numpy2torch(y, max_length), torch.tensor(mask[:,:,:max_length,:max_length], dtype=torch.bfloat16).to('cuda')
         else:
-            x, y = tokenize_func(task, return_lengths=False)
+            x, y = tokenize_func(task, return_lengths=False, IsDecode=IsDecode)
             yield numpy2torch(x, max_length), numpy2torch(y, max_length)
