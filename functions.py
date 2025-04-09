@@ -4,7 +4,7 @@ import random
 import torch
 from typing import List, Tuple, Optional
 
-''' Dataset processing utilities for ARC tasks test123'''
+''' Dataset processing utilities for ARC tasks '''
 @dataclass
 class TransformPara:
     """Parameters for grid transformations"""
