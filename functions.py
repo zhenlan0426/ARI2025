@@ -204,7 +204,7 @@ def causal_mask(*lengths, X_attend2_history=False):
 
         if segment_type == 'X':
             if X_attend2_history: # Xi attends to all previous segments
-                mask[start:end, 0:start] = True
+                mask[start:end, 0:end] = True
             else: # Xi attends only to its segment (intra-X attention)
                 mask[start:end, start:end] = True
             
