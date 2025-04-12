@@ -98,125 +98,6 @@ def numpy2torch(x, max_length):
     x = torch.tensor(x[:max_length][None]).to('cuda')
     return x
 
-def oneshot_mask(*lengths, X_attend2_history=False):
-    """
-    Creates a custom attention mask for ARC examples with parallel decoding.
-
-    Args:
-        *lengths: Sequence of integers for segment lengths
-                  (x1_len, y1_len, ..., xk_len, yk_len).
-        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
-
-    Returns:
-        numpy.ndarray: A 2D numpy array of shape (1, 1, total_len, total_len) containing attention mask values.
-                     Values are 0 for positions that can attend and -inf for masked positions.
-
-    Rules applied:
-    1. Xi attends fully to Xi (within-grid attention).
-    2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1)
-       AND its corresponding input Xi.
-    3. row attends to all preceding history, col attends to row in addtion to all preceding history
-       cell attends to row and col and all preceding history...  
-    """
-
-    total_len = sum(lengths)
-    # Initialize with False. We will selectively enable attention.
-    mask = np.full((total_len, total_len), False, dtype=bool)
-
-    segments = []
-    current_idx = 0
-    is_x_segment = True
-    for length in lengths:
-        start = current_idx
-        end = current_idx + length
-        segment_type = 'X' if is_x_segment else 'Y'
-        segments.append({'start': start, 'end': end, 'type': segment_type, 'len': length})
-        current_idx += length
-        is_x_segment = not is_x_segment
-
-    # Apply attention rules segment by segment
-    for segment in segments:
-        start, end = segment['start'], segment['end']
-        segment_type = segment['type']
-
-        if segment_type == 'X':
-            # Rule 1: Xi attends fully to itself (intra-X attention)
-            if X_attend2_history:
-                mask[start:end, 0:start] = True
-            else:
-                mask[start:end, start:end] = True
-            # Optional: Allow X to attend to prior history if needed
-            # mask[start:end, 0:start] = True
-
-        elif segment_type == 'Y':
-            # Rule 2: yi attends to all history up to and including Xi
-            mask[start:end, 0:start] = True
-
-            # diagonal attention for yi
-            indices = np.arange(start, end)
-            mask[indices, indices] = True # Allow self-attention
-
-            # all y_i attend to both row and column tokens, column token can attend to row token
-            mask[start:end, start] = True
-            mask[start+1:end, start+1] = True
-    
-    # Convert boolean mask to attention values (0 for attend, -inf for mask)
-    out = np.where(mask, 0, -np.inf)
-    return out[None][None]
-
-def causal_mask(*lengths, X_attend2_history=False):
-    """
-    Creates a custom attention mask for ARC examples with causal attention for Y segments.
-
-    Args:
-        *lengths: Sequence of integers for segment lengths
-                  (x1_len, y1_len, ..., xk_len, yk_len).
-        X_attend2_history (bool): If True, allows X_i segments to attend to all previous segments.
-
-    Returns:
-        numpy.ndarray: A 2D numpy array of shape (total_len, total_len) containing attention mask values.
-                     Values are 0 for positions that can attend and -inf for masked positions.
-
-    Rules applied:
-    1. Xi attends fully to Xi (within-grid attention).
-    2. yi attends fully to all preceding history (X1, y1, ..., Xi-1, yi-1, Xi)
-       AND within its segment previous yi-1, yi-2, ... 
-    """
-    total_len = sum(lengths)
-    # Initialize with False. We will selectively enable attention.
-    mask = np.full((total_len, total_len), False, dtype=bool)
-
-    segments = []
-    current_idx = 0
-    is_x_segment = True
-    for length in lengths:
-        start = current_idx
-        end = current_idx + length
-        segment_type = 'X' if is_x_segment else 'Y'
-        segments.append({'start': start, 'end': end, 'type': segment_type, 'len': length})
-        current_idx += length
-        is_x_segment = not is_x_segment
-
-    # Apply attention rules segment by segment
-    for segment in segments:
-        start, end = segment['start'], segment['end']
-        segment_type = segment['type']
-
-        if segment_type == 'X':
-            if X_attend2_history: # Xi attends to all previous segments
-                mask[start:end, 0:end] = True
-            else: # Xi attends only to its segment (intra-X attention)
-                mask[start:end, start:end] = True
-            
-        elif segment_type == 'Y':
-            # Each token can attend to itself and all previous tokens
-            for i in range(start, end):
-                mask[i, 0:i+1] = True  # Causal attention pattern
-    
-    # Convert boolean mask to attention values (0 for attend, -inf for mask)
-    out = np.where(mask, 0, -np.inf)
-    return out[None][None]
-
 def find_first_exceed(task, max_len, extra_tokens=4):
     # 4 for BOS_X, row, col, EOS_X in addtion to elements in input or output
     # return the first task index that exceeds max_len, task[index-1] is the last task
@@ -229,25 +110,32 @@ def find_first_exceed(task, max_len, extra_tokens=4):
             return i
     return len(task)  # If total never exceeds max_len
 
-def tokenize_causal(task, return_lengths=False, IsDecode=False):
+def tokenize_causal(task, autoregressive:bool, IsDecode=False):
     """
-    Tokenizes autoregressively.
-
+    Tokenizes a task for causal (autoregressive) training or inference.
+    
+    For training, converts a sequence of (input, output) grid pairs into a flat token sequence
+    where each token can attend to all previous tokens. The sequence follows the pattern:
+    (x1, y1, x2, y2, ..., xN, yN) with appropriate special tokens.
+    
+    For decoding, formats the input as (x1, y1, x2, y2, ..., xN, BOS_Y) to predict the final output.
+    
     Args:
         task: List of (input_grid, output_grid) tuples.
+              Each grid is a 2D list of integers.
               For decoding, the last output_grid can be None.
-        return_lengths: Whether to return sequence lengths for each x and y segment.
-        IsDecode: if using the model for decoding or training.
+        autoregressive: Whether to use autoregressive training mode.
+                        If True, both inputs and outputs predict the next token.
+                        If False, only output tokens predict the next output token.
+        IsDecode: Whether the function is being used for inference (True) or training (False).
 
     Returns:
         input_tokens: Numpy array of input token IDs.
                       For training: (x1, y1, x2, y2, ... xN, yN)
                       For decoding: (x1, y1, x2, y2, ..., xN, BOS_Y)
         final_target: Depends on IsDecode.
-                      For training: Numpy array of shifted target token IDs.
-                      For decoding: The raw 2d grid (yN) or None.
-        lengths (optional): List of sequence lengths corresponding to segments
-                           added to input_tokens.
+                      For training: Numpy array of shifted target token IDs for next-token prediction.
+                      For decoding: The raw 2D grid (yN) or None.
     """
     # Special token IDs
     BOS_X = 10  # Beginning of input grid
@@ -259,88 +147,90 @@ def tokenize_causal(task, return_lengths=False, IsDecode=False):
 
     input_tokens = []
     target_tokens = []
-    lengths = []  # To store lengths of each x and y sequence
-    
+    flag = not IsDecode and not autoregressive
     n = len(task)
     for i, (x, y) in enumerate(task):
         IsLast = (i == n-1) and IsDecode
         # Process input grid (x)
-        x_start_idx = len(input_tokens)
         
         input_tokens.append(BOS_X)
-        if not IsDecode:
+        if flag:
             target_tokens.append(PAD_TOKEN)
         
         for row in x:
             # Add row elements
             input_tokens.extend(row)
-            if not IsDecode:
+            if flag:
                 target_tokens.extend([PAD_TOKEN]*len(row))
 
             input_tokens.append(LINE_BREAK)
-            if not IsDecode:
+            if flag:
                 target_tokens.append(PAD_TOKEN)
 
         input_tokens.append(EOS_X)
-        if not IsDecode:
+        if flag:
             target_tokens.append(PAD_TOKEN)
         
-        x_len = len(input_tokens) - x_start_idx  # Length including special tokens
-
         # Process output grid (y)
-        y_start_idx = len(input_tokens)
         
         input_tokens.append(BOS_Y)
-        if not IsDecode:
+        if flag:
             target_tokens.append(PAD_TOKEN)  # Mask BOS_Y
         
-        lengths.append(x_len)
         if not IsLast:
             for row in y:
                 # Add row elements
                 input_tokens.extend(row)
-                if not IsDecode:
+                if flag:
                     target_tokens.extend(row)  # Keep y values in target
         
                 input_tokens.append(LINE_BREAK)
-                if not IsDecode:
+                if flag:
                     target_tokens.append(LINE_BREAK)
 
             input_tokens.append(EOS_Y)
-            if not IsDecode:
+            if flag:
                 target_tokens.append(EOS_Y)  # Include EOS_Y in target
-        
-            y_len = len(input_tokens) - y_start_idx  # Length including special tokens
-            lengths.append(y_len)
         else:
             target_tokens = y        
         
     # Create shifted targets (for next-token prediction)
-    if not IsDecode:
-        target_tokens = target_tokens[1:] + [PAD_TOKEN]
+    if IsDecode:
+        target_tokens = y
+    else:
+        if autoregressive:
+            target_tokens = input_tokens[1:] + [PAD_TOKEN]
+        else:
+            target_tokens = target_tokens[1:] + [PAD_TOKEN]
     
     # Convert to numpy arrays
-    if return_lengths:
-        return np.array(input_tokens), np.array(target_tokens) if target_tokens else None, lengths
-    else:
-        return np.array(input_tokens), np.array(target_tokens) if target_tokens else None
+    return np.array(input_tokens), np.array(target_tokens) if target_tokens else None
 
 def parse_causal_y(input_tokens):
     # TODO: Implement this
     pass
 
-def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], autoregressive:bool, max_length:int=None):
+def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
+                         is_decode:bool, autoregressive:bool, max_length:int=None):
     """
-    Tokenizes one-shot prediction.
+    Tokenizes one-shot prediction for ARC tasks.
     Uses distinct placeholder tokens for predicting output cells.
-    
+    when is_decode is true, return starting point for decoding, [x1,y1,x2,y2,...xk,BOS_Y]
+    needs to run autoregressive to generate row and col prediction,
+    then needs to append [PREDICT_CELL_Y] * (rows_y * cols_y) to input_tokens
+    for the final oneshot prediction
     Args:
         task (list): A list of tuples, each containing (input_grid, output_grid), where each grid
                      is a list of lists of integers (0-9)
-        max_length (int): Maximum sequence length to consider for tokenization
+        is_decode (bool): Whether this tokenization is for decoding (inference) or training
         autoregressive (bool): Whether to train model on x,y or just on last y (oneshot)
+        max_length (int, optional): Maximum sequence length to consider for tokenization
+        
     Returns:
-        Tuple of:
+        If is_decode=True:
+            - numpy array of input tokens
+            - 2d output_grid for the task
+        If is_decode=False:
             - numpy array of input tokens
             - numpy array of target tokens
             - integer idx such that target[idx:] is the oneshot target
@@ -371,7 +261,8 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], aut
 
     IGNORE_INDEX = -100
     input_tokens = []
-    target_tokens = []
+    if not is_decode:
+        target_tokens = []
 
     n_task = find_first_exceed(task, max_length)
     for input_grid, output_grid in task[:n_task-1]:
@@ -403,31 +294,33 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], aut
         input_tokens.append(EOS_Y)
         
         # --- Construct Model Target Sequence ---
-        if autoregressive:
-            # shifted input
-            target_tokens.append(row_token_x)
-            target_tokens.append(col_token_x)
-            target_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
-            target_tokens.append(EOS_X)
-            
-            # append the output grid
-            target_tokens.append(BOS_Y)
-            target_tokens.append(row_token_y)
-            target_tokens.append(col_token_y)
-            target_tokens.extend(flat_y)
-            target_tokens.append(EOS_Y)
-            target_tokens.append(IGNORE_INDEX)
-        else:
-            target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
+        if not is_decode:
+            if autoregressive:
+                # shifted input
+                target_tokens.append(row_token_x)
+                target_tokens.append(col_token_x)
+                target_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+                target_tokens.append(EOS_X)
+                
+                # append the output grid
+                target_tokens.append(BOS_Y)
+                target_tokens.append(row_token_y)
+                target_tokens.append(col_token_y)
+                target_tokens.extend(flat_y)
+                target_tokens.append(EOS_Y)
+                target_tokens.append(IGNORE_INDEX)
+            else:
+                target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
 
     # --- Construct Model Input and Target Sequence for the last task ---
     input_grid, output_grid = task[n_task-1]
     rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
     row_token_x = get_dimension_token(rows_x)
     col_token_x = get_dimension_token(cols_x)
-    rows_y, cols_y, flat_y = get_grid_dimensions(output_grid)
-    row_token_y = get_dimension_token(rows_y)
-    col_token_y = get_dimension_token(cols_y)
+    if output_grid is not None:
+        rows_y, cols_y, flat_y = get_grid_dimensions(output_grid)
+        row_token_y = get_dimension_token(rows_y)
+        col_token_y = get_dimension_token(cols_y)
     # append the input grid, same as before
     len_input = len(input_tokens)
     input_tokens.append(BOS_X)
@@ -435,48 +328,49 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], aut
     input_tokens.append(col_token_x)
     input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
     input_tokens.append(EOS_X)
-    if autoregressive:
-        target_tokens.append(row_token_x)
-        target_tokens.append(col_token_x)
-        target_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
-        target_tokens.append(EOS_X)
-        target_tokens.append(IGNORE_INDEX)
-    else:
-        target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
+    if not is_decode:
+        if autoregressive:
+            target_tokens.append(row_token_x)
+            target_tokens.append(col_token_x)
+            target_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+            target_tokens.append(EOS_X)
+            target_tokens.append(IGNORE_INDEX)
+        else:
+            target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
     len_input = len(input_tokens)
 
     # append the output grid
     input_tokens.append(BOS_Y)
-    target_tokens.append(row_token_y)
+    if is_decode:
+        return np.array(input_tokens), output_grid
+    else:
+        target_tokens.append(row_token_y)
+        input_tokens.append(row_token_y)
+        target_tokens.append(col_token_y)
 
-    input_tokens.append(row_token_y)
-    target_tokens.append(col_token_y)
+        input_tokens.append(col_token_y)
+        target_tokens.append(IGNORE_INDEX)
 
-    input_tokens.append(col_token_y)
-    target_tokens.append(IGNORE_INDEX)
+        input_tokens.extend([PREDICT_CELL_Y] * (rows_y * cols_y))
+        target_tokens.extend(flat_y)
+        return np.array(input_tokens), np.array(target_tokens), len_input
 
-    input_tokens.extend([PREDICT_CELL_Y] * (rows_y * cols_y))
-    target_tokens.extend(flat_y)
-    
-    return np.array(input_tokens), np.array(target_tokens), len_input
-
-def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=tokenize_causal,\
-             mask_func=causal_mask, X_attend2_history=False, IsDecode=False):
+def data_gen(data, IsTrain, max_length, autoregressive, tokenize_func=tokenize_causal, IsDecode=False):
     """Generate data for training or testing.
     
     Args:
         data: Dictionary containing 'train' and 'test' datasets
         IsTrain: Boolean indicating whether to use training data
         max_length: Maximum sequence length for truncation
-        return_lengths: Whether to return sequence lengths
-        tokenize_func: Function to use for tokenization
-        mask_func: Function to use for creating attention masks
-        X_attend2_history: Whether to allow X segments to attend to previous segments
-        IsDecode: when true, return the decoded input (x1,y1,x2,y2,...xk), 
-        target for yk (if yk present, i.e. local run instead of leaderboard run)
-            else return None for target
+        autoregressive: Whether to use autoregressive training mode
+        tokenize_func: Function to use for tokenization (default: tokenize_causal) or tokenize_oneshot
+        IsDecode: When true, return the decoded input (x1,y1,x2,y2,...xk) and 
+                 target for yk (if yk present, i.e. local run instead of leaderboard run)
+                 else return None for target
+    
     Yields:
-        Tokenized input, target, and optionally attention mask
+        For tokenize_causal: Tokenized input and target tensors
+        For tokenize_oneshot: Tokenized input, target tensors, and length of input
     """
     # Select dataset split
     dataset = data['train'] if IsTrain else data['test']
@@ -492,11 +386,8 @@ def data_gen(data, IsTrain, max_length, return_lengths=False, tokenize_func=toke
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
-        if return_lengths:
-            x, y, lengths = tokenize_func(task, return_lengths=True, IsDecode=IsDecode)
-            # Create appropriate attention mask based on tokenization function
-            mask = mask_func(*lengths, X_attend2_history=X_attend2_history)
-            yield numpy2torch(x, max_length), numpy2torch(y, max_length), torch.tensor(mask[:,:,:max_length,:max_length], dtype=torch.bfloat16).to('cuda')
-        else:
-            x, y = tokenize_func(task, return_lengths=False, IsDecode=IsDecode)
-            yield numpy2torch(x, max_length), numpy2torch(y, max_length)
+        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode)
+        if len(out) == 2: 
+            yield numpy2torch(out[0], max_length), numpy2torch(out[1], max_length)
+        else: # tokenize_oneshot return input, output, and length
+            yield numpy2torch(out[0], max_length), numpy2torch(out[1], max_length), out[2]
