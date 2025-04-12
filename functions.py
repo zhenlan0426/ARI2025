@@ -93,9 +93,9 @@ def backwardTask(task, tpara):
     # return [(backward(x, tpara), backward(y, tpara)) for x, y in task]
     pass
 
-def numpy2torch(x, max_length):
+def numpy2torch(x):
     """Convert numpy array to torch tensor and move to GPU, with length truncation."""
-    x = torch.tensor(x[:max_length][None]).to('cuda')
+    x = torch.tensor(x[None]).to('cuda')
     return x
 
 def find_first_exceed(task, max_len, extra_tokens=4):
@@ -110,7 +110,7 @@ def find_first_exceed(task, max_len, extra_tokens=4):
             return i
     return len(task)  # If total never exceeds max_len
 
-def tokenize_causal(task, autoregressive:bool, IsDecode=False):
+def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
     """
     Tokenizes a task for causal (autoregressive) training or inference.
     
@@ -127,6 +127,7 @@ def tokenize_causal(task, autoregressive:bool, IsDecode=False):
         autoregressive: Whether to use autoregressive training mode.
                         If True, both inputs and outputs predict the next token.
                         If False, only output tokens predict the next output token.
+        max_length: Maximum sequence length for truncation.
         IsDecode: Whether the function is being used for inference (True) or training (False).
 
     Returns:
@@ -204,33 +205,34 @@ def tokenize_causal(task, autoregressive:bool, IsDecode=False):
             target_tokens = target_tokens[1:] + [PAD_TOKEN]
     
     # Convert to numpy arrays
-    return np.array(input_tokens), np.array(target_tokens) if target_tokens else None
+    return np.array(input_tokens[:max_length]), np.array(target_tokens[:max_length]) if target_tokens else None
 
 def parse_causal_y(input_tokens):
     # TODO: Implement this
     pass
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
-                         is_decode:bool, autoregressive:bool, max_length:int=None):
+                     max_length:int,\
+                     IsDecode:bool, autoregressive:bool):
     """
     Tokenizes one-shot prediction for ARC tasks.
     Uses distinct placeholder tokens for predicting output cells.
-    when is_decode is true, return starting point for decoding, [x1,y1,x2,y2,...xk,BOS_Y]
+    when IsDecode is true, return starting point for decoding, [x1,y1,x2,y2,...xk,BOS_Y]
     needs to run autoregressive to generate row and col prediction,
     then needs to append [PREDICT_CELL_Y] * (rows_y * cols_y) to input_tokens
     for the final oneshot prediction
     Args:
         task (list): A list of tuples, each containing (input_grid, output_grid), where each grid
                      is a list of lists of integers (0-9)
-        is_decode (bool): Whether this tokenization is for decoding (inference) or training
+        IsDecode (bool): Whether this tokenization is for decoding (inference) or training
         autoregressive (bool): Whether to train model on x,y or just on last y (oneshot)
         max_length (int, optional): Maximum sequence length to consider for tokenization
         
     Returns:
-        If is_decode=True:
+        If IsDecode=True:
             - numpy array of input tokens
             - 2d output_grid for the task
-        If is_decode=False:
+        If IsDecode=False:
             - numpy array of input tokens
             - numpy array of target tokens
             - integer idx such that target[idx:] is the oneshot target
@@ -261,7 +263,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
 
     IGNORE_INDEX = -100
     input_tokens = []
-    if not is_decode:
+    if not IsDecode:
         target_tokens = []
 
     n_task = find_first_exceed(task, max_length)
@@ -279,7 +281,6 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
 
         # --- Construct Model input Sequence ---
         # append the input grid
-        len_input = len(input_tokens)
         input_tokens.append(BOS_X)
         input_tokens.append(row_token_x)
         input_tokens.append(col_token_x)
@@ -294,7 +295,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
         input_tokens.append(EOS_Y)
         
         # --- Construct Model Target Sequence ---
-        if not is_decode:
+        if not IsDecode:
             if autoregressive:
                 # shifted input
                 target_tokens.append(row_token_x)
@@ -310,10 +311,11 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                 target_tokens.append(EOS_Y)
                 target_tokens.append(IGNORE_INDEX)
             else:
-                target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
+                target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len(target_tokens)))
 
     # --- Construct Model Input and Target Sequence for the last task ---
-    input_grid, output_grid = task[n_task-1]
+    # if IsDecode is true, use the last task as the input and output
+    input_grid, output_grid = task[n_task-1] if not IsDecode else task[-1]
     rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
     row_token_x = get_dimension_token(rows_x)
     col_token_x = get_dimension_token(cols_x)
@@ -322,13 +324,12 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
         row_token_y = get_dimension_token(rows_y)
         col_token_y = get_dimension_token(cols_y)
     # append the input grid, same as before
-    len_input = len(input_tokens)
     input_tokens.append(BOS_X)
     input_tokens.append(row_token_x)
     input_tokens.append(col_token_x)
     input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
     input_tokens.append(EOS_X)
-    if not is_decode:
+    if not IsDecode:
         if autoregressive:
             target_tokens.append(row_token_x)
             target_tokens.append(col_token_x)
@@ -336,12 +337,12 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
             target_tokens.append(EOS_X)
             target_tokens.append(IGNORE_INDEX)
         else:
-            target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
-    len_input = len(input_tokens)
+            target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len(target_tokens)))
 
+    len_input = len(input_tokens)
     # append the output grid
     input_tokens.append(BOS_Y)
-    if is_decode:
+    if IsDecode:
         return np.array(input_tokens), output_grid
     else:
         target_tokens.append(row_token_y)
@@ -386,8 +387,8 @@ def data_gen(data, IsTrain, max_length, autoregressive, tokenize_func=tokenize_c
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
-        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode)
+        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length)
         if len(out) == 2: 
-            yield numpy2torch(out[0], max_length), numpy2torch(out[1], max_length)
+            yield numpy2torch(out[0]), out[1] if IsDecode else numpy2torch(out[1])
         else: # tokenize_oneshot return input, output, and length
-            yield numpy2torch(out[0], max_length), numpy2torch(out[1], max_length), out[2]
+            yield numpy2torch(out[0]), out[1] if IsDecode else numpy2torch(out[1]), out[2]
