@@ -329,7 +329,7 @@ def parse_causal_y(input_tokens):
     # TODO: Implement this
     pass
 
-def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], max_length:int):
+def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], autoregressive:bool, max_length:int=None):
     """
     Tokenizes one-shot prediction.
     Uses distinct placeholder tokens for predicting output cells.
@@ -338,13 +338,12 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], max
         task (list): A list of tuples, each containing (input_grid, output_grid), where each grid
                      is a list of lists of integers (0-9)
         max_length (int): Maximum sequence length to consider for tokenization
-        
+        autoregressive (bool): Whether to train model on x,y or just on last y (oneshot)
     Returns:
         Tuple of:
             - numpy array of input tokens
             - numpy array of target tokens
-            - integer indicating the length of input tokens before the final output grid,
-               where full attention can be applied
+            - integer idx such that target[idx:] is the oneshot target
     """
     # Token definitions with direct values
     # 0-9: Grid cell values (digits)
@@ -403,8 +402,23 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], max
         input_tokens.extend(flat_y)
         input_tokens.append(EOS_Y)
         
-        # --- Construct Model Target Sequence ---        
-        target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
+        # --- Construct Model Target Sequence ---
+        if autoregressive:
+            # shifted input
+            target_tokens.append(row_token_x)
+            target_tokens.append(col_token_x)
+            target_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+            target_tokens.append(EOS_X)
+            
+            # append the output grid
+            target_tokens.append(BOS_Y)
+            target_tokens.append(row_token_y)
+            target_tokens.append(col_token_y)
+            target_tokens.extend(flat_y)
+            target_tokens.append(EOS_Y)
+            target_tokens.append(IGNORE_INDEX)
+        else:
+            target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
 
     # --- Construct Model Input and Target Sequence for the last task ---
     input_grid, output_grid = task[n_task-1]
@@ -421,7 +435,14 @@ def tokenize_arc_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], max
     input_tokens.append(col_token_x)
     input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
     input_tokens.append(EOS_X)
-    target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
+    if autoregressive:
+        target_tokens.append(row_token_x)
+        target_tokens.append(col_token_x)
+        target_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+        target_tokens.append(EOS_X)
+        target_tokens.append(IGNORE_INDEX)
+    else:
+        target_tokens.extend([IGNORE_INDEX] * (len(input_tokens) - len_input))
     len_input = len(input_tokens)
 
     # append the output grid
