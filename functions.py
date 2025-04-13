@@ -149,6 +149,12 @@ def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
     input_tokens = []
     target_tokens = []
     flag = not IsDecode and not autoregressive
+    n_task = find_first_exceed(task, max_length)
+    if IsDecode:
+        # For decoding, must include the last task
+        task = task[:n_task-1] + [task[-1]] 
+    else:
+        task = task[:n_task]
     n = len(task)
     for i, (x, y) in enumerate(task):
         IsLast = (i == n-1) and IsDecode
@@ -196,20 +202,14 @@ def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
             target_tokens = y        
         
     # Create shifted targets (for next-token prediction)
-    if IsDecode:
-        target_tokens = y
-    else:
+    if not IsDecode:
         if autoregressive:
             target_tokens = input_tokens[1:] + [PAD_TOKEN]
         else:
             target_tokens = target_tokens[1:] + [PAD_TOKEN]
     
     # Convert to numpy arrays
-    return np.array(input_tokens[:max_length]), np.array(target_tokens[:max_length]) if target_tokens else None
-
-def parse_causal_y(input_tokens):
-    # TODO: Implement this
-    pass
+    return np.array(input_tokens), np.array(target_tokens) if target_tokens else None
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                      max_length:int,\
@@ -529,3 +529,153 @@ class OneshotDecoder(object):
         output_grid = self.predict_output_grid()
 
         return output_grid
+
+class CausalDecoder(object):
+    def __init__(self, model, max_depth: int = 31 * 30 + 1, brunch_factor: int = 3):
+        """Initialize the searcher with a pre-trained model."""
+
+        self.max_depth = max_depth
+        self.model = model
+        self.best_paths = []
+        self.nlls = []
+        self.min_nll = float('inf')
+        self.brunch_factor = brunch_factor
+
+    def decode(self, input_tokens):
+        self.dfs_generate(input_tokens)
+        idx = np.argmin(self.nlls)
+        best_path = self.best_paths[idx]
+        return self.detokenize_causal(best_path)
+
+    @staticmethod
+    def detokenize_causal(tokens):
+        """
+        Detokenizes a 1D sequence of tokens (after BOS_Y) back into a 2D grid.
+
+        This function is the inverse of the `tokenize_causal` function, specifically
+        for the decoding phase (IsDecode=True).  It assumes the input `tokens`
+        starts *after* the BOS_Y token.
+
+        Args:
+            tokens: A 1D list of integer tokens.
+
+        Returns:
+            A 2D numpy array of integers
+        """
+        LINE_BREAK = 12
+        EOS_Y = 14
+
+        grid = []
+        row = []
+        for token in tokens:
+            if token == EOS_Y:
+                if row:
+                    grid.append(row)
+                break  # Stop at EOS_Y
+            elif token == LINE_BREAK:
+                grid.append(row)
+                row = []
+            else:
+                row.append(token)
+        return np.array(grid)
+    
+    @staticmethod
+    def check_equal_line_lengths(tensor):
+        """ Check if all lines in a torch tensor have the same length when called at a line break position."""
+        tensor = tensor[0]
+        if tensor[-1].item() != 12: # only check if the last token is a line break
+            return True
+        idx = (tensor == 12).nonzero(as_tuple=True)[0]
+        if len(idx) <= 1:
+            return True
+        return len(torch.unique(idx[1:] - idx[:-1])) == 1
+        
+    @torch.no_grad()
+    def dfs_generate(self, current_ids, current_nll = 0, past_key_values = None, current_depth = 0):
+        """Performs Depth-First Search to find the lowest NLL completion."""
+        # current_ids is torch.Tensor of Shape: (1, seq_len)
+        model = self.model
+        max_depth = self.max_depth
+        device = model.device
+        # Safety check for recursion depth
+        if current_depth > max_depth:
+            return
+
+        # Prepare inputs for the model
+        if past_key_values is None:
+            # First call, process the whole sequence
+            input_ids_step = current_ids
+        else:
+            # Subsequent calls, only process the last token
+            input_ids_step = current_ids[:, -1:]
+
+        # Get logits and new KV cache
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            outputs = model(
+                input_ids=input_ids_step,
+                past_key_values=past_key_values,
+                use_cache=True, # Crucial for efficiency
+            )
+
+        logits = outputs.logits.float() # Shape: (1, input_seq_len, vocab_size)
+        new_past_key_values = outputs.past_key_values # Updated KV cache
+
+        # Get logits for the *next* token prediction
+        # Logits shape is (batch_size, sequence_length, vocab_size)
+        next_token_logits = logits[:, -1, :]
+
+        # Calculate log probabilities and negative log likelihoods
+        log_probs = torch.log_softmax(next_token_logits, dim=-1)
+        nlls = -log_probs # Shape: (1, vocab_size)
+
+        # Sort potential next tokens by NLL (ascending)
+        # We only need to explore the top `branching_factor` candidates
+        sorted_nlls, sorted_indices = torch.sort(nlls.squeeze(), descending=False)
+        sorted_nlls = sorted_nlls[:self.brunch_factor]
+        sorted_indices = sorted_indices[:self.brunch_factor]
+        
+        # Iterate through the most promising next tokens
+        for next_token_id, next_token_nll in zip(sorted_indices, sorted_nlls):
+            next_token_id = next_token_id.item()
+            next_token_nll = next_token_nll.item()
+
+            potential_total_nll = current_nll + next_token_nll
+
+            # --- Pruning ---
+            if potential_total_nll >= self.min_nll:
+                # If the current path's NLL is already worse than the best complete
+                # sequence found so far, prune this branch.
+                break
+
+            
+            if past_key_values is None: # first call
+                next_ids = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
+            else: # Append the chosen token
+                next_ids = torch.cat(
+                    [current_ids, torch.tensor([[next_token_id]], dtype=torch.long, device=device)],
+                    dim=1
+                )
+            
+            if not self.check_equal_line_lengths(next_ids):
+                # If the line lengths are not equal, prune this branch
+                continue
+            
+            # --- Base Case: EOS token ---
+            if next_token_id == 14 and next_ids[0][-1].item() == 12: # Line break followed by EOS
+                # print(f"Found EOS. Path NLL: {potential_total_nll:.4f} | Path Len: {current_depth}")
+                self.best_paths.append(next_ids[0].tolist())
+                self.nlls.append(potential_total_nll)
+                self.min_nll = min(self.min_nll, potential_total_nll)
+                # Continue searching other branches even after finding an EOS
+                continue # Don't recurse further down this path
+
+            # --- Recursive Step ---
+            # Pass the `new_past_key_values` which contains the cache state *after*
+            self.dfs_generate(current_ids=next_ids,
+                              current_nll=potential_total_nll,
+                              past_key_values=new_past_key_values,
+                              current_depth=current_depth + 1,
+                             )
+        # del new_past_key_values, past_key_values, logits, next_token_logits, log_probs, nlls
+        # gc.collect()
+        # torch.cuda.empty_cache()
