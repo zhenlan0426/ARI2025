@@ -110,8 +110,10 @@ def get_gemma_model(model_name, head_dim, lm_head_path, peft_path, isTrain, max_
         model.lm_head.weight.requires_grad_(True);
     gc.collect()
     torch.cuda.empty_cache()
-    model.lm_head.load_state_dict(torch.load(lm_head_path))
-    model = PeftModel.from_pretrained(model, peft_path, is_trainable=isTrain)
+    if lm_head_path is not None:
+        model.lm_head.load_state_dict(torch.load(lm_head_path))
+    if peft_path is not None:
+        model = PeftModel.from_pretrained(model, peft_path, is_trainable=isTrain)
     if not isTrain:
         FastLanguageModel.for_inference(model);
     return model
@@ -232,7 +234,7 @@ def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
             target_tokens = target_tokens[1:] + [PAD_TOKEN]
     
     # Convert to numpy arrays
-    return np.array(input_tokens), np.array(target_tokens) if target_tokens else None
+    return np.array(input_tokens), np.array(target_tokens) if target_tokens is not None else None
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                      max_length:int,\
@@ -529,12 +531,13 @@ class OneshotDecoder(object):
         return output_grid
 
 class CausalDecoder(object):
-    def __init__(self, model, max_depth: int = 31 * 30 + 1, brunch_factor: int = 3):
+    def __init__(self, model, max_depth: int = 31 * 30 + 1, brunch_factor: int = 3, IsDebug=False):
         """Initialize the searcher with a pre-trained model."""
 
         self.max_depth = max_depth
         self.model = model
         self.brunch_factor = brunch_factor
+        self.IsDebug = IsDebug
         self.reset()  # Initialize/reset state variables
 
     def reset(self):
@@ -597,6 +600,8 @@ class CausalDecoder(object):
     def dfs_generate(self, current_ids, current_nll = 0, past_key_values = None, current_depth = 0):
         """Performs Depth-First Search to find the lowest NLL completion."""
         # current_ids is torch.Tensor of Shape: (1, seq_len)
+        if self.IsDebug:
+            print(f"Current NLL: {current_nll:.4f} | Path Len: {current_depth} | Current IDs: {current_ids[0].tolist()}")
         model = self.model
         max_depth = self.max_depth
         device = model.device
@@ -665,7 +670,7 @@ class CausalDecoder(object):
             
             # --- Base Case: EOS token ---
             if next_token_id == 14 and next_ids[0][-1].item() == 12: # Line break followed by EOS
-                # print(f"Found EOS. Path NLL: {potential_total_nll:.4f} | Path Len: {current_depth}")
+                # print(f"Found EOS. Path NLL: {potential_total_nll:.4f} | Path Len: {current_depth}",next_ids[0].tolist())
                 self.best_paths.append(next_ids[0].tolist())
                 self.nlls.append(potential_total_nll)
                 self.min_nll = min(self.min_nll, potential_total_nll)
