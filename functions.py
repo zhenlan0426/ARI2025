@@ -3,6 +3,9 @@ import numpy as np
 import random
 import torch
 from typing import List, Tuple, Optional
+from unsloth import FastModel,FastLanguageModel
+import gc
+from peft import PeftModel
 
 ''' Dataset processing utilities for ARC tasks '''
 @dataclass
@@ -92,6 +95,26 @@ def backwardTask(task, tpara):
     # Currently disabled - uncomment to use
     # return [(backward(x, tpara), backward(y, tpara)) for x, y in task]
     pass
+
+''' Model and tokenization utilities '''
+
+def get_gemma_model(model_name, head_dim, lm_head_path, peft_path, isTrain, max_seq_length = 8192):
+    model, _ = FastModel.from_pretrained(model_name = model_name,
+                                         max_seq_length = max_seq_length,
+                                         load_in_4bit = True,
+                                         resize_model_vocab=head_dim,
+                                        )
+    del model.vision_tower
+    model = model.base_model
+    if isTrain:
+        model.lm_head.weight.requires_grad_(True);
+    gc.collect()
+    torch.cuda.empty_cache()
+    model.lm_head.load_state_dict(torch.load(lm_head_path))
+    model = PeftModel.from_pretrained(model, peft_path, is_trainable=isTrain)
+    if not isTrain:
+        FastLanguageModel.for_inference(model);
+    return model
 
 def numpy2torch(x):
     """Convert numpy array to torch tensor and move to GPU, with length truncation."""
@@ -343,7 +366,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     # append the output grid
     input_tokens.append(BOS_Y)
     if IsDecode:
-        return np.array(input_tokens), output_grid
+        return np.array(input_tokens), np.array(output_grid) if output_grid is not None else None
     else:
         target_tokens.append(row_token_y)
         input_tokens.append(row_token_y)
@@ -407,8 +430,16 @@ class OneshotDecoder(object):
         self.PREDICT_CELL_Y = 16  # Token representing a cell prediction
         self.SIZE_TOKEN_OFFSET = 16  # Offset for row/col tokens
         self.branching_factor = branching_factor  # Number of branches to explore in DFS
-        self.min_nll = float('inf')  # Minimum negative log likelihood encountered
-        self.past_key_values = None  # Cache for past key/value pairs in the model
+        self.reset()  # Initialize/reset state variables
+
+    def reset(self):
+        """
+        Resets the decoder's state variables.
+        """
+        self.min_nll = float('inf')
+        self.past_key_values = None
+        self.rows = None
+        self.cols = None
 
     @torch.no_grad()
     def predict_dimensions(self, current_ids, current_nll=0.0, past_key_values=None, current_depth=0):
@@ -471,13 +502,15 @@ class OneshotDecoder(object):
             next_token_id = next_token_id.item()
             next_token_nll = next_token_nll.item()
             potential_total_nll = current_nll + next_token_nll
-
+            print(f"Depth: {current_depth}, Trying token: {next_token_id}, NLL: {next_token_nll:.4f}, Potential Total NLL: {potential_total_nll:.4f}, Min NLL: {self.min_nll}")
             # Prune if the potential NLL exceeds the current best
             if potential_total_nll >= self.min_nll:
+                print(f"  Pruning branch (NLL >= min_nll)")
                 break
 
             # Constrain tokens to valid row/column values based on depth
             if not (self.SIZE_TOKEN_OFFSET + 1 <= next_token_id <= self.SIZE_TOKEN_OFFSET + self.max_dim):
+                print(f"  Skipping token (invalid dimension range)")
                 continue
 
 
@@ -522,6 +555,7 @@ class OneshotDecoder(object):
         :param input_tokens: Initial input sequence ending with BOS_Y.
         :return: 2D numpy array of the predicted output grid.
         """
+        self.reset() # reset for new inputs
         # Step 1: Predict dimensions
         self.predict_dimensions(input_tokens)
 
@@ -536,12 +570,17 @@ class CausalDecoder(object):
 
         self.max_depth = max_depth
         self.model = model
+        self.brunch_factor = brunch_factor
+        self.reset()  # Initialize/reset state variables
+
+    def reset(self):
+        """Reset the searcher state."""
         self.best_paths = []
         self.nlls = []
         self.min_nll = float('inf')
-        self.brunch_factor = brunch_factor
 
     def decode(self, input_tokens):
+        self.reset
         self.dfs_generate(input_tokens)
         idx = np.argmin(self.nlls)
         best_path = self.best_paths[idx]
