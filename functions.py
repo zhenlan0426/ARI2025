@@ -266,8 +266,8 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     EOS_X = 11       # End of input grid
     BOS_Y = 12       # Beginning of output grid
     EOS_Y = 13       # End of output grid
-    # PREDICT_ROW_Y = 14  # no longer used
-    # PREDICT_COL_Y = 15  # no longer used
+    PREDICT_ROW_Y = 14  
+    PREDICT_COL_Y = 15  
     PREDICT_CELL_Y = 16  # Placeholder for predicting output cells
     
     # Dimension tokens (SIZE_1 to SIZE_30 map to 17 to 46)
@@ -311,9 +311,11 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
         input_tokens.append(EOS_X)
         
         # append the output grid
-        input_tokens.append(BOS_Y)
+        input_tokens.append(PREDICT_ROW_Y)
         input_tokens.append(row_token_y)
+        input_tokens.append(PREDICT_COL_Y)
         input_tokens.append(col_token_y)
+        input_tokens.append(BOS_Y)
         input_tokens.extend(flat_y)
         input_tokens.append(EOS_Y)
         
@@ -326,10 +328,12 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                 target_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
                 target_tokens.append(EOS_X)
                 
-                # append the output grid
-                target_tokens.append(BOS_Y)
+                # append the output grid, no need to train on special token as at inference time, they will be manually added
+                target_tokens.append(-100)
                 target_tokens.append(row_token_y)
+                target_tokens.append(-100)
                 target_tokens.append(col_token_y)
+                target_tokens.append(-100)
                 target_tokens.extend(flat_y)
                 target_tokens.append(EOS_Y)
                 target_tokens.append(IGNORE_INDEX)
@@ -364,16 +368,17 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
 
     len_input = len(input_tokens)
     # append the output grid
-    input_tokens.append(BOS_Y)
+    input_tokens.append(PREDICT_ROW_Y)
     if IsDecode:
         return np.array(input_tokens), np.array(output_grid) if output_grid is not None else None
     else:
         target_tokens.append(row_token_y)
         input_tokens.append(row_token_y)
+        target_tokens.append(-100)
+        input_tokens.append(PREDICT_COL_Y)
         target_tokens.append(col_token_y)
-
         input_tokens.append(col_token_y)
-        target_tokens.append(IGNORE_INDEX)
+        target_tokens.append(-100)
 
         input_tokens.extend([PREDICT_CELL_Y] * (rows_y * cols_y))
         target_tokens.extend(flat_y)
@@ -417,19 +422,19 @@ def data_gen(data, IsTrain, max_length, autoregressive, tokenize_func=tokenize_c
             yield numpy2torch(out[0]), out[1] if IsDecode else numpy2torch(out[1]), out[2]
 
 class OneshotDecoder(object):
-    def __init__(self, model, max_dim=30, branching_factor=5):
+    def __init__(self, model, max_dim=30):
         """
         The OneshotDecoder class decodes an tokenized input sequence into a 2D output grid using a pre-trained model.
         
         This class employs a two-step process:
-        1. **Dimension Prediction**: It uses a depth-first search (DFS) approach to predict the dimensions (number of rows and columns) of the output grid.
+        1. **Dimension Prediction**: predict the dimensions (number of rows and columns) of the output grid.
         2. **Grid Prediction**: Once the dimensions are determined, it generates the entire grid in a single forward pass of the model.
         """
         self.model = model
         self.max_dim = max_dim
         self.PREDICT_CELL_Y = 16  # Token representing a cell prediction
         self.SIZE_TOKEN_OFFSET = 16  # Offset for row/col tokens
-        self.branching_factor = branching_factor  # Number of branches to explore in DFS
+        self.PREDICT_COL_Y = 15  # Token for predicting column size
         self.reset()  # Initialize/reset state variables
 
     def reset(self):
@@ -454,80 +459,39 @@ class OneshotDecoder(object):
         """
         model = self.model
         device = model.device
-        max_depth = 2  # Stop after predicting row and column tokens
-
-        # Base case: Reached depth 2 (row and column tokens predicted)
-        if current_depth == max_depth:
-            if current_nll < self.min_nll:
-                row_token = current_ids[0][-2].item()
-                col_token = current_ids[0][-1].item()
-                rows = row_token - self.SIZE_TOKEN_OFFSET
-                cols = col_token - self.SIZE_TOKEN_OFFSET
-                self.min_nll = current_nll
-                self.rows = rows
-                self.cols = cols
-            return
-
-        # Prepare inputs for the model
-        if past_key_values is None:
-            input_ids_step = current_ids  # First call, process the whole sequence
-        else:
-            input_ids_step = current_ids[:, -1:]  # Subsequent calls, process the last token
-
-        # Get logits and updated key/value cache
+        ### Step 1: Predict row_token_y after PREDICT_ROW_Y
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             outputs = model(
-                input_ids=input_ids_step,
+                input_ids=current_ids,
                 past_key_values=past_key_values,
-                use_cache=True,  # Improves efficiency by reusing cache
+                use_cache=True,
             )
-
-        new_past_key_values = outputs.past_key_values  # Updated KV cache
-        if current_depth == 0:
-            self.past_key_values = new_past_key_values
-        # Get logits for the next token prediction
-        next_token_logits =  outputs.logits[:, -1, :].float()  # Shape: (1, vocab_size)
-
-        # Calculate log probabilities and negative log likelihoods
-        log_probs = torch.log_softmax(next_token_logits, dim=-1)
-        nlls = -log_probs  # Shape: (1, vocab_size)
-
-        # Sort potential next tokens by NLL (ascending) and limit to branching factor
-        sorted_nlls, sorted_indices = torch.sort(nlls.squeeze(), descending=False)
-        sorted_nlls = sorted_nlls[:self.branching_factor]
-        sorted_indices = sorted_indices[:self.branching_factor]
-
-        # Iterate through the most promising next tokens
-        for next_token_id, next_token_nll in zip(sorted_indices, sorted_nlls):
-            next_token_id = next_token_id.item()
-            next_token_nll = next_token_nll.item()
-            potential_total_nll = current_nll + next_token_nll
-            print(f"Depth: {current_depth}, Trying token: {next_token_id}, NLL: {next_token_nll:.4f}, Potential Total NLL: {potential_total_nll:.4f}, Min NLL: {self.min_nll}")
-            # Prune if the potential NLL exceeds the current best
-            if potential_total_nll >= self.min_nll:
-                print(f"  Pruning branch (NLL >= min_nll)")
-                break
-
-            # Constrain tokens to valid row/column values based on depth
-            if not (self.SIZE_TOKEN_OFFSET + 1 <= next_token_id <= self.SIZE_TOKEN_OFFSET + self.max_dim):
-                print(f"  Skipping token (invalid dimension range)")
-                continue
-
-
-            # Append the chosen token to the sequence
-            next_ids = torch.cat(
-                [current_ids, torch.tensor([[next_token_id]], dtype=torch.long, device=device)],
-                dim=1
+        past_key_values = outputs.past_key_values
+        next_token_logits = outputs.logits[:, -1, :]
+        row_token_y = torch.argmax(next_token_logits, dim=-1).item()  # Predicted row dimension token
+        assert self.SIZE_TOKEN_OFFSET + 1 <= row_token_y <= self.SIZE_TOKEN_OFFSET + self.max_dim, \
+            f"Row token {row_token_y} out of range ({self.SIZE_TOKEN_OFFSET + 1}, {self.SIZE_TOKEN_OFFSET + self.max_dim})"
+        self.rows = row_token_y - self.SIZE_TOKEN_OFFSET
+        
+        # Step 2: Predict col_token_y after PREDICT_COL_Y
+        # Append row_token_y and PREDICT_COL_Y as input_ids
+        input_ids = torch.tensor([[row_token_y, self.PREDICT_COL_Y]], dtype=torch.long, device=device)
+        
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            outputs = model(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
             )
-
-            # Recursive step to generate the next token
-            self.predict_dimensions(
-                current_ids=next_ids,
-                current_nll=potential_total_nll,
-                past_key_values=new_past_key_values,
-                current_depth=current_depth + 1,
-            )
-
+        self.past_key_values = outputs.past_key_values
+        next_token_logits = outputs.logits[:, -1, :]
+        col_token_y = torch.argmax(next_token_logits, dim=-1).item()  # Predicted column dimension token
+        
+        # Calculate cols_y from col_token_y
+        assert self.SIZE_TOKEN_OFFSET + 1 <= col_token_y <= self.SIZE_TOKEN_OFFSET + self.max_dim, \
+            f"Column token {col_token_y} out of range ({self.SIZE_TOKEN_OFFSET + 1}, {self.SIZE_TOKEN_OFFSET + self.max_dim})"
+        self.cols = col_token_y - self.SIZE_TOKEN_OFFSET
+        
     @torch.no_grad()
     def predict_output_grid(self):
         """
@@ -535,15 +499,15 @@ class OneshotDecoder(object):
         """
         # Encode rows and cols as tokens
         rows, cols = self.rows, self.cols
-        row_token = self.SIZE_TOKEN_OFFSET + rows
         col_token = self.SIZE_TOKEN_OFFSET + cols
 
-        # Append row token, col token, and [PREDICT_CELL_Y] * (rows * cols) to input
-        input = torch.tensor([[row_token, col_token] + [self.PREDICT_CELL_Y] * (rows * cols)], dtype=torch.long, device='cuda')
+        # Append col token and [PREDICT_CELL_Y] * (rows * cols) to input
+        input = torch.tensor([[col_token] + [self.PREDICT_CELL_Y] * (rows * cols)], dtype=torch.long, device='cuda')
 
         # Get model predictions for the entire sequence
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits = self.model(input_ids=input, past_key_values=self.past_key_values, use_cache=True).logits # Shape: (1, seq_len, vocab_size)
+        del self.past_key_values
         cell_preds = logits[0, -rows * cols:, :].argmax(dim=-1).cpu().detach().numpy() # Shape: (rows * cols, )
         cell_preds = cell_preds.reshape(rows, cols)
         return cell_preds
