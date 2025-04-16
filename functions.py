@@ -2,17 +2,19 @@ from dataclasses import dataclass
 import numpy as np
 import random
 import torch
+import torch.nn as nn
 from typing import List, Tuple, Optional
 from unsloth import FastModel,FastLanguageModel
 import gc
 import os
+import shutil
 import re
 import json
 from dataclasses import asdict
 from dataclasses import dataclass, field
 from peft import PeftModel
 
-
+''' ---------------------------- Model utilities ----------------------------- '''
 @dataclass
 class GlobalConfig:
     """Configuration class for model training and data processing."""
@@ -23,7 +25,8 @@ class GlobalConfig:
     max_length: int
     autoregressive: bool
     epochs: int
-    
+    NeedPosition: bool
+
     @staticmethod
     def find_largest_version():
         # Get current directory
@@ -46,7 +49,11 @@ class GlobalConfig:
         if self.tokenization not in ('causal', 'oneshot'):
             raise ValueError(f"Invalid tokenization: {self.tokenization}. Must be 'causal' or 'oneshot'.")
         save_path = '../../Model/model_' + self.find_largest_version()
-        os.makedirs(save_path, exist_ok=True)
+        if os.path.exists(save_path):
+            shutil.rmtree(save_path)
+            print(f"Deleted folder and contents: {save_path}")
+        os.makedirs(save_path)
+        print(f"Created folder: {save_path}")
         self.folder = save_path + '/'
         if self.tokenization == 'causal':
             self.tokenizer = tokenize_causal
@@ -69,7 +76,89 @@ class GlobalConfig:
             data = json.load(json_file)
         return cls(**data)
 
-''' Dataset processing utilities for ARC tasks '''
+
+class PositionalEmbedding2D(nn.Module):
+    """
+    Adds 2D positional embeddings to a flattened grid input.
+
+    Assumes the input `x` is of shape (batch_size, seq_len, hidden_dim),
+    where seq_len is height * width, and the flattening order is row-first.
+
+    The positional embedding is the sum of a learnable row embedding and a
+    learnable column embedding.
+    """
+    def __init__(self, hidden_dim: int, max_height: int=31, max_width: int=31):
+        """
+        Initializes the 2D positional embedding layer.
+
+        Args:
+            hidden_dim (int): The dimensionality of the embeddings and the input tensor.
+            max_height (int): The maximum expected height of the 2D grid.
+                               Used to size the row embedding table.
+            max_width (int): The maximum expected width of the 2D grid.
+                              Used to size the column embedding table.
+        """
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_height = max_height
+        self.max_width = max_width
+        self.row_embed = nn.Embedding(max_height, hidden_dim)
+        self.col_embed = nn.Embedding(max_width, hidden_dim)
+
+
+    def reset_parameters(self,r,c):
+        # r,c should be of shape (1, seq) on the right device
+        self.r = r
+        self.c = c
+
+    def forward(self, module, input, output):
+        """
+        to match signature forward hook
+        """
+        # Look up embeddings for row and column indices
+        # self.row_embed(rows) -> Shape: [seq_len, hidden_dim]
+        # self.col_embed(cols) -> Shape: [seq_len, hidden_dim]
+        row_pos_embedding = self.row_embed(self.r)
+        col_pos_embedding = self.col_embed(self.c)
+
+        return output + row_pos_embedding + col_pos_embedding
+        # Need __call__ to delegate to forward for hook registration if using nn.Module
+    def __call__(self, module, input, output):
+        return self.forward(module, input, output)
+
+# embedding_layer = model.get_input_embeddings()
+# hook_manager = PositionalEmbedding2D(embedding_layer.weight.shape[1]).to(model.device)
+# hook_handle = embedding_layer.register_forward_hook(hook_manager)
+# for x,y,row_index,col_index in data_gen():
+#     hook_manager.reset_parameters(row_index, col_index)
+#     yhat = model(x)
+
+def get_gemma_model(model_name, head_dim, isTrain, lm_head_path=None, peft_path=None, max_seq_length = 8192):
+    model, _ = FastModel.from_pretrained(model_name = model_name,
+                                         max_seq_length = max_seq_length,
+                                         load_in_4bit = True,
+                                         resize_model_vocab=head_dim,
+                                        )
+    try:
+        del model.vision_tower
+        model = model.base_model
+    except:
+        print("Not a vision language model")
+    model.model.embed_tokens.padding_idx = None # otherwise token zero will be ignored
+    if isTrain:
+        model.train();
+        model.lm_head.weight.requires_grad_(True);
+    gc.collect()
+    torch.cuda.empty_cache()
+    if lm_head_path is not None:
+        model.lm_head.load_state_dict(torch.load(lm_head_path))
+    if peft_path is not None:
+        model = PeftModel.from_pretrained(model, peft_path, is_trainable=isTrain)
+    if not isTrain:
+        FastLanguageModel.for_inference(model);
+    return model
+
+'''  ----------------------------------- Dataset Transformation utilities ------------------------------------- '''
 @dataclass
 class TransformPara:
     """Parameters for grid transformations"""
@@ -158,33 +247,7 @@ def backwardTask(task, tpara):
     # return [(backward(x, tpara), backward(y, tpara)) for x, y in task]
     pass
 
-''' Model and tokenization utilities '''
-
-def get_gemma_model(model_name, head_dim, isTrain, lm_head_path=None, peft_path=None, max_seq_length = 8192):
-    model, _ = FastModel.from_pretrained(model_name = model_name,
-                                         max_seq_length = max_seq_length,
-                                         load_in_4bit = True,
-                                         resize_model_vocab=head_dim,
-                                        )
-    try:
-        del model.vision_tower
-        model = model.base_model
-    except:
-        print("Not a vision language model")
-    model.model.embed_tokens.padding_idx = None # otherwise token zero will be ignored
-    if isTrain:
-        model.train();
-        model.lm_head.weight.requires_grad_(True);
-    gc.collect()
-    torch.cuda.empty_cache()
-    if lm_head_path is not None:
-        model.lm_head.load_state_dict(torch.load(lm_head_path))
-    if peft_path is not None:
-        model = PeftModel.from_pretrained(model, peft_path, is_trainable=isTrain)
-    if not isTrain:
-        FastLanguageModel.for_inference(model);
-    return model
-
+'''  ----------------------------------- Tokenization utilities ------------------------------------- '''
 def numpy2torch(x):
     """Convert numpy array to torch tensor and move to GPU, with length truncation."""
     x = torch.tensor(x[None]).to('cuda')
@@ -202,33 +265,29 @@ def find_first_exceed(task, max_len, extra_tokens=4):
             return i
     return len(task)  # If total never exceeds max_len
 
-def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
+def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False):
     """
-    Tokenizes a task for causal (autoregressive) training or inference.
-    
-    For training, converts a sequence of (input, output) grid pairs into a flat token sequence
-    where each token can attend to all previous tokens. The sequence follows the pattern:
-    (x1, y1, x2, y2, ..., xN, yN) with appropriate special tokens.
-    
-    For decoding, formats the input as (x1, y1, x2, y2, ..., xN, BOS_Y) to predict the final output.
-    
+    Tokenizes a task for causal (autoregressive) training or inference,
+    optionally providing 2D positional indices using optimized list extensions.
+
     Args:
         task: List of (input_grid, output_grid) tuples.
               Each grid is a 2D list of integers.
               For decoding, the last output_grid can be None.
         autoregressive: Whether to use autoregressive training mode.
-                        If True, both inputs and outputs predict the next token.
-                        If False, only output tokens predict the next output token.
         max_length: Maximum sequence length for truncation.
         IsDecode: Whether the function is being used for inference (True) or training (False).
+        NeedPosition: If True, return row and column indices for 2D position embedding.
 
     Returns:
-        input_tokens: Numpy array of input token IDs.
-                      For training: (x1, y1, x2, y2, ... xN, yN)
-                      For decoding: (x1, y1, x2, y2, ..., xN, BOS_Y)
-        final_target: Depends on IsDecode.
-                      For training: Numpy array of shifted target token IDs for next-token prediction.
-                      For decoding: The raw 2D grid (yN) or None.
+        If NeedPosition is False:
+            input_tokens: Numpy array of input token IDs.
+            final_target: Numpy array of shifted target token IDs (training) or raw grid (decoding).
+        If NeedPosition is True:
+            input_tokens: Numpy array of input token IDs.
+            final_target: Same as above.
+            row_indices: Numpy array of row indices.
+            col_indices: Numpy array of column indices.
     """
     # Special token IDs
     BOS_X = 10  # Beginning of input grid
@@ -240,6 +299,9 @@ def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
 
     input_tokens = []
     target_tokens = []
+    if NeedPosition:
+        row_indices = []
+        col_indices = []
     flag = not IsDecode and not autoregressive
     n_task = find_first_exceed(task, max_length)
     if IsDecode:
@@ -255,43 +317,69 @@ def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
         input_tokens.append(BOS_X)
         if flag:
             target_tokens.append(PAD_TOKEN)
-        
-        for row in x:
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
+            
+        for r_idx, row in enumerate(x):
             # Add row elements
             input_tokens.extend(row)
             if flag:
                 target_tokens.extend([PAD_TOKEN]*len(row))
+            if NeedPosition:
+                row_len = len(row)
+                row_indices.extend([r_idx + 1] * row_len)
+                col_indices.extend(list(range(1, row_len + 1)))
 
             input_tokens.append(LINE_BREAK)
+            if NeedPosition:
+                row_indices.append(0)
+                col_indices.append(0)
             if flag:
                 target_tokens.append(PAD_TOKEN)
 
         input_tokens.append(EOS_X)
         if flag:
             target_tokens.append(PAD_TOKEN)
-        
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
         # Process output grid (y)
         
         input_tokens.append(BOS_Y)
         if flag:
             target_tokens.append(PAD_TOKEN)  # Mask BOS_Y
-        
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
+
         if not IsLast:
-            for row in y:
+            for r_idx, row in enumerate(y):
                 # Add row elements
                 input_tokens.extend(row)
                 if flag:
                     target_tokens.extend(row)  # Keep y values in target
-        
+                if NeedPosition:
+                    # Extend position indices for the row
+                    row_len = len(row)
+                    row_indices.extend([r_idx + 1] * row_len)
+                    col_indices.extend(list(range(1, row_len + 1)))
+
                 input_tokens.append(LINE_BREAK)
+                if NeedPosition:
+                    row_indices.append(0)
+                    col_indices.append(0)                
                 if flag:
                     target_tokens.append(LINE_BREAK)
 
             input_tokens.append(EOS_Y)
+            if NeedPosition:
+                row_indices.append(0)
+                col_indices.append(0)
             if flag:
                 target_tokens.append(EOS_Y)  # Include EOS_Y in target
         else:
-            target_tokens = y        
+            target_tokens = y
         
     # Create shifted targets (for next-token prediction)
     if not IsDecode:
@@ -301,33 +389,71 @@ def tokenize_causal(task, autoregressive:bool, max_length, IsDecode=False):
             target_tokens = target_tokens[1:] + [PAD_TOKEN]
     
     # Convert to numpy arrays
-    return np.array(input_tokens), np.array(target_tokens) if target_tokens is not None else None
+    if NeedPosition:
+        return np.array(input_tokens), np.array(target_tokens) if target_tokens is not None else None, np.array(row_indices), np.array(col_indices)
+    else:
+        return np.array(input_tokens), np.array(target_tokens) if target_tokens is not None else None
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                      max_length:int,\
-                     IsDecode:bool, autoregressive:bool):
+                     IsDecode:bool, autoregressive:bool, NeedPosition:bool=False):
     """
     Tokenizes one-shot prediction for ARC tasks.
-    Uses distinct placeholder tokens for predicting output cells.
-    when IsDecode is true, return starting point for decoding, [x1,y1,x2,y2,...xk,BOS_Y]
-    needs to run autoregressive to generate row and col prediction,
-    then needs to append [PREDICT_CELL_Y] * (rows_y * cols_y) to input_tokens
-    for the final oneshot prediction
+
     Args:
-        task (list): A list of tuples, each containing (input_grid, output_grid), where each grid
-                     is a list of lists of integers (0-9)
-        IsDecode (bool): Whether this tokenization is for decoding (inference) or training
-        autoregressive (bool): Whether to train model on x,y or just on last y (oneshot)
-        max_length (int, optional): Maximum sequence length to consider for tokenization
-        
+        task (list): A list of tuples, where each tuple represents an example and
+                     contains (input_grid, output_grid). The last tuple might be
+                     (test_input_grid, None) during decoding or
+                     (test_input_grid, test_output_grid) during training/evaluation.
+                     Each grid is a list of lists of integers (0-9).
+        max_length (int): Maximum total sequence length (tokens) to consider from
+                          the examples. Examples exceeding this length when concatenated
+                          might be partially dropped.
+        IsDecode (bool): If True, tokenizes only up to the point of predicting the
+                         output row dimension for the *last* task item. If False,
+                         tokenizes for training, including target sequences.
+        autoregressive (bool): If True and IsDecode is False, generates targets for
+                               predicting *all* tokens autoregressively (shifted input).
+                               If False and IsDecode is False, generates targets only
+                               for the final output grid prediction (one-shot), masking
+                               other parts with IGNORE_INDEX. This flag is ignored if
+                               IsDecode is True.
+        NeedPosition (bool, optional): If True, calculates and returns positional
+                                       indices (row, column) for each input token.
+                                       Defaults to False.
+
     Returns:
+        A tuple whose contents depend on IsDecode and NeedPosition:
+
         If IsDecode=True:
-            - numpy array of input tokens
-            - 2d output_grid for the task
+            If NeedPosition=False:
+                - input_tokens (np.array): Input token sequence for the final task,
+                                           ready for starting the decoding process.
+                - output_grid (np.array or None): The ground truth output grid for the
+                                                  final task, if provided; otherwise None.
+            If NeedPosition=True:
+                - input_tokens (np.array): Input token sequence.
+                - output_grid (np.array or None): The ground truth output grid.
+                - row_indices (np.array): Row indices corresponding to input_tokens.
+                - col_indices (np.array): Column indices corresponding to input_tokens.
+
         If IsDecode=False:
-            - numpy array of input tokens
-            - numpy array of target tokens
-            - integer idx such that target[idx:] is the oneshot target
+            If NeedPosition=False:
+                - input_tokens (np.array): Full input token sequence including demonstration
+                                           examples and the final task's input setup
+                                           (with PREDICT_CELL_Y placeholders).
+                - target_tokens (np.array): Target token sequence for training. Contains
+                                            IGNORE_INDEX for non-target positions.
+                - oneshot_target_idx (int): The index in `target_tokens` from which the
+                                            actual one-shot output grid cell targets begin.
+                                            (Corresponds to the first PREDICT_CELL_Y
+                                             in input_tokens).
+            If NeedPosition=True:
+                - input_tokens (np.array): Full input token sequence.
+                - target_tokens (np.array): Target token sequence.
+                - oneshot_target_idx (int): Index where one-shot targets begin.
+                - row_indices (np.array): Row indices corresponding to input_tokens.
+                - col_indices (np.array): Column indices corresponding to input_tokens.
     """
     # Token definitions with direct values
     # 0-9: Grid cell values (digits)
@@ -348,25 +474,47 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
         num_cols = len(grid[0])
         flat_grid = [cell for row in grid for cell in row]    
         return num_rows, num_cols, flat_grid
-
+    
+    def get_grid_dimensions_extend(grid):
+        num_rows = len(grid)
+        num_cols = len(grid[0])
+        cell_values = []
+        row_indices = []
+        col_indices = []
+        col_index_pattern = list(range(1, num_cols + 1))
+        for r_idx, row in enumerate(grid):
+            cell_values.extend(row)
+            row_indices.extend([r_idx + 1] * num_cols)
+            col_indices.extend(col_index_pattern)
+        return num_rows, num_cols, cell_values, row_indices, col_indices
+    
     def get_dimension_token(dim_size):
         """Gets the token ID for a given dimension size."""
         return SIZE_TOKEN_OFFSET + dim_size
 
+    get_dimention = get_grid_dimensions if not NeedPosition else get_grid_dimensions_extend
     IGNORE_INDEX = -100
     input_tokens = []
     if not IsDecode:
         target_tokens = []
-
+    if NeedPosition:
+        row_indices = []
+        col_indices = []
     n_task = find_first_exceed(task, max_length)
     for input_grid, output_grid in task[:n_task-1]:
         # --- Validate and Flatten Input Grid (X) ---
-        rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
+        if NeedPosition:
+            rows_x, cols_x, flat_x, row_indices_x, col_indices_x = get_dimention(input_grid)
+        else:
+            rows_x, cols_x, flat_x = get_dimention(input_grid)
         row_token_x = get_dimension_token(rows_x)
         col_token_x = get_dimension_token(cols_x)
 
         # --- Validate and Flatten Output Grid (Y) ---
-        rows_y, cols_y, flat_y = get_grid_dimensions(output_grid)
+        if NeedPosition:
+            rows_y, cols_y, flat_y, row_indices_y, col_indices_y = get_dimention(output_grid)
+        else:
+            rows_y, cols_y, flat_y = get_dimention(output_grid)
         row_token_y = get_dimension_token(rows_y) # Actual target token for rows_y
         col_token_y = get_dimension_token(cols_y) # Actual target token for cols_y
         num_output_cells = rows_y * cols_y
@@ -376,8 +524,17 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
         input_tokens.append(BOS_X)
         input_tokens.append(row_token_x)
         input_tokens.append(col_token_x)
+        if NeedPosition:
+            row_indices.extend([0] * 3)
+            col_indices.extend([0] * 3)
         input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+        if NeedPosition:
+            row_indices.extend(row_indices_x)
+            col_indices.extend(col_indices_x)
         input_tokens.append(EOS_X)
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
         
         # append the output grid
         input_tokens.append(PREDICT_ROW_Y)
@@ -385,8 +542,17 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
         input_tokens.append(PREDICT_COL_Y)
         input_tokens.append(col_token_y)
         input_tokens.append(BOS_Y)
+        if NeedPosition:
+            row_indices.extend([0] * 5)
+            col_indices.extend([0] * 5)
         input_tokens.extend(flat_y)
+        if NeedPosition:
+            row_indices.extend(row_indices_y)
+            col_indices.extend(col_indices_y)
         input_tokens.append(EOS_Y)
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
         
         # --- Construct Model Target Sequence ---
         if not IsDecode:
@@ -412,19 +578,34 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     # --- Construct Model Input and Target Sequence for the last task ---
     # if IsDecode is true, use the last task as the input and output
     input_grid, output_grid = task[n_task-1] if not IsDecode else task[-1]
-    rows_x, cols_x, flat_x = get_grid_dimensions(input_grid)
+    if NeedPosition:
+        rows_x, cols_x, flat_x, row_indices_x, col_indices_x = get_dimention(input_grid)
+    else:
+        rows_x, cols_x, flat_x = get_dimention(input_grid)
     row_token_x = get_dimension_token(rows_x)
     col_token_x = get_dimension_token(cols_x)
     if output_grid is not None:
-        rows_y, cols_y, flat_y = get_grid_dimensions(output_grid)
+        if NeedPosition:
+            rows_y, cols_y, flat_y, row_indices_y, col_indices_y = get_dimention(output_grid)
+        else:
+            rows_y, cols_y, flat_y = get_dimention(output_grid)
         row_token_y = get_dimension_token(rows_y)
         col_token_y = get_dimension_token(cols_y)
     # append the input grid, same as before
     input_tokens.append(BOS_X)
     input_tokens.append(row_token_x)
     input_tokens.append(col_token_x)
+    if NeedPosition:
+        row_indices.extend([0] * 3)
+        col_indices.extend([0] * 3)
     input_tokens.extend(flat_x) # Add flattened input grid cells (as ints 0-9)
+    if NeedPosition:
+        row_indices.extend(row_indices_x)
+        col_indices.extend(col_indices_x)
     input_tokens.append(EOS_X)
+    if NeedPosition:
+        row_indices.append(0)
+        col_indices.append(0)
     if not IsDecode:
         if autoregressive:
             target_tokens.append(row_token_x)
@@ -438,8 +619,14 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     len_input = len(input_tokens)
     # append the output grid
     input_tokens.append(PREDICT_ROW_Y)
+    if NeedPosition:
+        row_indices.append(0)
+        col_indices.append(0)
     if IsDecode:
-        return np.array(input_tokens), np.array(output_grid) if output_grid is not None else None
+        if NeedPosition:
+            return np.array(input_tokens), np.array(output_grid) if output_grid is not None else None, np.array(row_indices), np.array(col_indices)
+        else:
+            return np.array(input_tokens), np.array(output_grid) if output_grid is not None else None
     else:
         target_tokens.append(row_token_y)
         input_tokens.append(row_token_y)
@@ -448,10 +635,18 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
         target_tokens.append(col_token_y)
         input_tokens.append(col_token_y)
         target_tokens.append(-100)
-
+        if NeedPosition:
+            row_indices.extend([0] * 3)
+            col_indices.extend([0] * 3)
         input_tokens.extend([PREDICT_CELL_Y] * (rows_y * cols_y))
+        if NeedPosition:
+            row_indices.extend(row_indices_y)
+            col_indices.extend(col_indices_y)
         target_tokens.extend(flat_y)
-        return np.array(input_tokens), np.array(target_tokens), len_input
+        if NeedPosition:
+            return np.array(input_tokens), np.array(target_tokens), len_input, np.array(row_indices), np.array(col_indices)
+        else:
+            return np.array(input_tokens), np.array(target_tokens), len_input
 
 def data_gen(data, IsTrain, max_length, autoregressive, tokenize_func=tokenize_causal, IsDecode=False):
     """Generate data for training or testing.
