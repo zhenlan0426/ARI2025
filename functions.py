@@ -5,7 +5,66 @@ import torch
 from typing import List, Tuple, Optional
 from unsloth import FastModel,FastLanguageModel
 import gc
+import os
+import re
+import json
+from dataclasses import asdict
+from dataclasses import dataclass, field
 from peft import PeftModel
+
+
+@dataclass
+class GlobalConfig:
+    """Configuration class for model training and data processing."""
+    model_name: str
+    lm_head_dim: int
+    r: int # peft
+    data_path: str
+    tokenization: str
+    max_length: int
+    autoregressive: bool
+    epochs: int
+    
+    @staticmethod
+    def find_largest_version():
+        # Get current directory
+        current_dir = os.getcwd()
+        largest_number = -1  # Initialize to -1 in case no valid files are found
+        # Regular expression to match numbers at the end of filename before .ipynb
+        pattern = r'(\d+)\.ipynb$'
+        # Iterate through files in current directory
+        for filename in os.listdir(current_dir):
+            # Check if file is .ipynb and matches pattern
+            match = re.search(pattern, filename)
+            if match:
+                # Extract number and convert to integer
+                number = int(match.group(1))
+                # Update largest number if current is larger
+                largest_number = max(largest_number, number)
+        return str(largest_number)
+    
+    def __post_init__(self):
+        if self.tokenization not in ('causal', 'oneshot'):
+            raise ValueError(f"Invalid tokenization: {self.tokenization}. Must be 'causal' or 'oneshot'.")
+        save_path = '../../Model/model_' + self.find_largest_version()
+        os.makedirs(save_path, exist_ok=True)
+        self.folder = save_path + '/'
+        if self.tokenization == 'causal':
+            self.tokenizer = tokenize_causal
+        else:
+            self.tokenizer = tokenize_oneshot
+    
+    def save_to_json(self) -> None:
+        """Save the dataclass instance to a JSON file."""
+        with open(self.folder + 'globalConfig.json', 'w') as json_file:
+            json.dump(asdict(self), json_file, indent=4)
+
+    @classmethod
+    def load_from_json(cls, file_path: str):
+        """Load a dataclass instance from a JSON file."""
+        with open(file_path + 'globalConfig.json', 'r') as json_file:
+            data = json.load(json_file)
+        return cls(**data)
 
 ''' Dataset processing utilities for ARC tasks '''
 @dataclass
@@ -98,7 +157,7 @@ def backwardTask(task, tpara):
 
 ''' Model and tokenization utilities '''
 
-def get_gemma_model(model_name, head_dim, lm_head_path, peft_path, isTrain, max_seq_length = 8192):
+def get_gemma_model(model_name, head_dim, isTrain, lm_head_path=None, peft_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
                                          max_seq_length = max_seq_length,
                                          load_in_4bit = True,
@@ -106,7 +165,9 @@ def get_gemma_model(model_name, head_dim, lm_head_path, peft_path, isTrain, max_
                                         )
     del model.vision_tower
     model = model.base_model
+    model.model.embed_tokens.padding_idx = None # otherwise token zero will be ignored
     if isTrain:
+        model.train();
         model.lm_head.weight.requires_grad_(True);
     gc.collect()
     torch.cuda.empty_cache()
@@ -449,15 +510,15 @@ class OneshotDecoder(object):
         self.cols = None
 
     @torch.no_grad()
-    def predict_dimensions(self, current_ids, current_nll=0.0, past_key_values=None, current_depth=0):
+    def predict_dimensions(self, current_ids, past_key_values=None):
         """
-        Performs Depth-First Search to predict row and column dimensions up to depth 2.
+        argmax predicts the row and column dimensions of the output grid.
         
         Args:
             current_ids (torch.Tensor): Current sequence of token IDs, shape (1, seq_len) on cuda.
-            current_nll (float): Accumulated negative log likelihood of the sequence.
             past_key_values: Cached key/value pairs from previous model calls for efficiency.
-            current_depth (int): Current depth in the DFS recursion.
+        Returns:
+            bool: True if an error occurs (invalid token prediction), False otherwise.
         """
         model = self.model
         device = model.device
@@ -471,8 +532,8 @@ class OneshotDecoder(object):
         past_key_values = outputs.past_key_values
         next_token_logits = outputs.logits[:, -1, :]
         row_token_y = torch.argmax(next_token_logits, dim=-1).item()  # Predicted row dimension token
-        assert self.SIZE_TOKEN_OFFSET + 1 <= row_token_y <= self.SIZE_TOKEN_OFFSET + self.max_dim, \
-            f"Row token {row_token_y} out of range ({self.SIZE_TOKEN_OFFSET + 1}, {self.SIZE_TOKEN_OFFSET + self.max_dim})"
+        if not (self.SIZE_TOKEN_OFFSET + 1 <= row_token_y <= self.SIZE_TOKEN_OFFSET + self.max_dim):
+            return True
         self.rows = row_token_y - self.SIZE_TOKEN_OFFSET
         
         # Step 2: Predict col_token_y after PREDICT_COL_Y
@@ -490,10 +551,11 @@ class OneshotDecoder(object):
         col_token_y = torch.argmax(next_token_logits, dim=-1).item()  # Predicted column dimension token
         
         # Calculate cols_y from col_token_y
-        assert self.SIZE_TOKEN_OFFSET + 1 <= col_token_y <= self.SIZE_TOKEN_OFFSET + self.max_dim, \
-            f"Column token {col_token_y} out of range ({self.SIZE_TOKEN_OFFSET + 1}, {self.SIZE_TOKEN_OFFSET + self.max_dim})"
+        if not (self.SIZE_TOKEN_OFFSET + 1 <= col_token_y <= self.SIZE_TOKEN_OFFSET + self.max_dim):
+            return True
         self.cols = col_token_y - self.SIZE_TOKEN_OFFSET
-        
+        return False  # No error
+
     @torch.no_grad()
     def predict_output_grid(self):
         """
@@ -523,7 +585,9 @@ class OneshotDecoder(object):
         """
         self.reset() # reset for new inputs
         # Step 1: Predict dimensions
-        self.predict_dimensions(input_tokens)
+        if self.predict_dimensions(input_tokens):
+            print("Invalid token prediction for dimensions.")
+            return None
 
         # Step 2: Predict the output grid
         output_grid = self.predict_output_grid()
