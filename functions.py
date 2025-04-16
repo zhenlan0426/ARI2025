@@ -17,7 +17,6 @@ from peft import PeftModel
 class GlobalConfig:
     """Configuration class for model training and data processing."""
     model_name: str
-    lm_head_dim: int
     r: int # peft
     data_path: str
     tokenization: str
@@ -51,8 +50,12 @@ class GlobalConfig:
         self.folder = save_path + '/'
         if self.tokenization == 'causal':
             self.tokenizer = tokenize_causal
+            self.decoder = CausalDecoder
+            self.lm_head_dim = 16
         else:
             self.tokenizer = tokenize_oneshot
+            self.decoder = OneshotDecoder
+            self.lm_head_dim = 48
     
     def save_to_json(self) -> None:
         """Save the dataclass instance to a JSON file."""
@@ -163,8 +166,11 @@ def get_gemma_model(model_name, head_dim, isTrain, lm_head_path=None, peft_path=
                                          load_in_4bit = True,
                                          resize_model_vocab=head_dim,
                                         )
-    del model.vision_tower
-    model = model.base_model
+    try:
+        del model.vision_tower
+        model = model.base_model
+    except:
+        print("Not a vision language model")
     model.model.embed_tokens.padding_idx = None # otherwise token zero will be ignored
     if isTrain:
         model.train();
