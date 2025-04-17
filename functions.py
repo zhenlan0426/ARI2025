@@ -8,6 +8,7 @@ from unsloth import FastModel,FastLanguageModel
 import gc
 import os
 import shutil
+import time
 import re
 import json
 from dataclasses import asdict
@@ -126,14 +127,7 @@ class PositionalEmbedding2D(nn.Module):
     def __call__(self, module, input, output):
         return self.forward(module, input, output)
 
-# embedding_layer = model.get_input_embeddings()
-# hook_manager = PositionalEmbedding2D(embedding_layer.weight.shape[1]).to(model.device)
-# hook_handle = embedding_layer.register_forward_hook(hook_manager)
-# for x,y,row_index,col_index in data_gen():
-#     hook_manager.reset_parameters(row_index, col_index)
-#     yhat = model(x)
-
-def get_gemma_model(model_name, head_dim, isTrain, lm_head_path=None, peft_path=None, max_seq_length = 8192):
+def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
                                          max_seq_length = max_seq_length,
                                          load_in_4bit = True,
@@ -145,18 +139,26 @@ def get_gemma_model(model_name, head_dim, isTrain, lm_head_path=None, peft_path=
     except:
         print("Not a vision language model")
     model.model.embed_tokens.padding_idx = None # otherwise token zero will be ignored
+    if NeedPosition:
+        embedding_layer = model.get_input_embeddings()
+        PosEmbedModel = PositionalEmbedding2D(embedding_layer.weight.shape[1]).to(model.device)
+        if saved_path is not None:
+            PosEmbedModel.load_state_dict(torch.load(saved_path + 'PosEmbedModel.pth'))
+        embedding_layer.register_forward_hook(PosEmbedModel);
     if isTrain:
         model.train();
         model.lm_head.weight.requires_grad_(True);
     gc.collect()
     torch.cuda.empty_cache()
-    if lm_head_path is not None:
-        model.lm_head.load_state_dict(torch.load(lm_head_path))
-    if peft_path is not None:
-        model = PeftModel.from_pretrained(model, peft_path, is_trainable=isTrain)
+    if saved_path is not None:
+        model.lm_head.load_state_dict(torch.load(saved_path + 'lm_heads_weights.pth'))
+        model = PeftModel.from_pretrained(model, saved_path + 'finetuned_model', is_trainable=isTrain)
     if not isTrain:
         FastLanguageModel.for_inference(model);
-    return model
+    if NeedPosition:
+        return model, PosEmbedModel
+    else:
+        return model
 
 '''  ----------------------------------- Dataset Transformation utilities ------------------------------------- '''
 @dataclass
@@ -250,7 +252,7 @@ def backwardTask(task, tpara):
 '''  ----------------------------------- Tokenization utilities ------------------------------------- '''
 def numpy2torch(x):
     """Convert numpy array to torch tensor and move to GPU, with length truncation."""
-    x = torch.tensor(x[None]).to('cuda')
+    x = torch.tensor(x)[None].to('cuda')
     return x
 
 def find_first_exceed(task, max_len, extra_tokens=4):
@@ -390,9 +392,10 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
     
     # Convert to numpy arrays
     if NeedPosition:
-        return np.array(input_tokens), np.array(target_tokens) if target_tokens is not None else None, np.array(row_indices), np.array(col_indices)
+        return {"input_tokens":numpy2torch(input_tokens), "target_tokens": numpy2torch(target_tokens) if target_tokens is not None else None, \
+                "row_indices": numpy2torch(row_indices), "col_indices": numpy2torch(col_indices)}
     else:
-        return np.array(input_tokens), np.array(target_tokens) if target_tokens is not None else None
+        return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None}
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                      max_length:int,\
@@ -622,12 +625,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     if NeedPosition:
         row_indices.append(0)
         col_indices.append(0)
-    if IsDecode:
-        if NeedPosition:
-            return np.array(input_tokens), np.array(output_grid) if output_grid is not None else None, np.array(row_indices), np.array(col_indices)
-        else:
-            return np.array(input_tokens), np.array(output_grid) if output_grid is not None else None
-    else:
+    if not IsDecode:
         target_tokens.append(row_token_y)
         input_tokens.append(row_token_y)
         target_tokens.append(-100)
@@ -643,12 +641,15 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
             row_indices.extend(row_indices_y)
             col_indices.extend(col_indices_y)
         target_tokens.extend(flat_y)
-        if NeedPosition:
-            return np.array(input_tokens), np.array(target_tokens), len_input, np.array(row_indices), np.array(col_indices)
-        else:
-            return np.array(input_tokens), np.array(target_tokens), len_input
+    else:
+        target_tokens = output_grid
+    if NeedPosition:
+        return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, \
+                "len_input":len_input, "row_indices":numpy2torch(row_indices), "col_indices":numpy2torch(col_indices)}
+    else:
+        return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, max_length, autoregressive, tokenize_func=tokenize_causal, IsDecode=False):
+def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False):
     """Generate data for training or testing.
     
     Args:
@@ -679,11 +680,8 @@ def data_gen(data, IsTrain, max_length, autoregressive, tokenize_func=tokenize_c
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
-        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length)
-        if len(out) == 2: 
-            yield numpy2torch(out[0]), out[1] if IsDecode else numpy2torch(out[1])
-        else: # tokenize_oneshot return input, output, and length
-            yield numpy2torch(out[0]), out[1] if IsDecode else numpy2torch(out[1]), out[2]
+        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition)
+        yield out
 
 class OneshotDecoder(object):
     def __init__(self, model, max_dim=30):
@@ -812,7 +810,7 @@ class CausalDecoder(object):
         self.min_nll = float('inf')
 
     def decode(self, input_tokens):
-        self.reset
+        self.reset()
         self.dfs_generate(input_tokens)
         idx = np.argmin(self.nlls)
         best_path = self.best_paths[idx]
