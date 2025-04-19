@@ -684,7 +684,7 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
         yield out
 
 class OneshotDecoder(object):
-    def __init__(self, model, max_dim=30):
+    def __init__(self, model, PosEmbedModel=None, max_dim=30):
         """
         The OneshotDecoder class decodes an tokenized input sequence into a 2D output grid using a pre-trained model.
         
@@ -694,6 +694,7 @@ class OneshotDecoder(object):
         """
         self.model = model
         self.max_dim = max_dim
+        self.PosEmbedModel = PosEmbedModel
         self.PREDICT_CELL_Y = 16  # Token representing a cell prediction
         self.SIZE_TOKEN_OFFSET = 16  # Offset for row/col tokens
         self.PREDICT_COL_Y = 15  # Token for predicting column size
@@ -709,7 +710,7 @@ class OneshotDecoder(object):
         self.cols = None
 
     @torch.no_grad()
-    def predict_dimensions(self, current_ids, past_key_values=None):
+    def predict_dimensions(self, current_ids, row_indices=None, col_indices=None, past_key_values=None):
         """
         argmax predicts the row and column dimensions of the output grid.
         
@@ -722,6 +723,8 @@ class OneshotDecoder(object):
         model = self.model
         device = model.device
         ### Step 1: Predict row_token_y after PREDICT_ROW_Y
+        if self.PosEmbedModel is not None:
+            self.PosEmbedModel.reset_parameters(row_indices, col_indices)
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             outputs = model(
                 input_ids=current_ids,
@@ -738,7 +741,10 @@ class OneshotDecoder(object):
         # Step 2: Predict col_token_y after PREDICT_COL_Y
         # Append row_token_y and PREDICT_COL_Y as input_ids
         input_ids = torch.tensor([[row_token_y, self.PREDICT_COL_Y]], dtype=torch.long, device=device)
-        
+        if self.PosEmbedModel is not None:
+            row_indices = torch.tensor([[0, 0]], dtype=torch.long, device=device)
+            col_indices = torch.tensor([[0, 0]], dtype=torch.long, device=device)
+            self.PosEmbedModel.reset_parameters(row_indices, col_indices)
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             outputs = model(
                 input_ids=input_ids,
@@ -766,7 +772,16 @@ class OneshotDecoder(object):
 
         # Append col token and [PREDICT_CELL_Y] * (rows * cols) to input
         input = torch.tensor([[col_token] + [self.PREDICT_CELL_Y] * (rows * cols)], dtype=torch.long, device='cuda')
-
+        if self.PosEmbedModel is not None:
+            row_indices = [0] # col_token
+            col_indices = [0] # col_token
+            col_index_pattern = list(range(1, cols + 1))
+            for r_idx in range(rows):
+                row_indices.extend([r_idx + 1] * cols)
+                col_indices.extend(col_index_pattern)
+            row_indices = numpy2torch(row_indices)
+            col_indices = numpy2torch(col_indices)
+            self.PosEmbedModel.reset_parameters(row_indices, col_indices)
         # Get model predictions for the entire sequence
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits = self.model(input_ids=input, past_key_values=self.past_key_values, use_cache=True).logits # Shape: (1, seq_len, vocab_size)
@@ -850,15 +865,36 @@ class CausalDecoder(object):
     
     @staticmethod
     def check_equal_line_lengths(tensor):
-        """ Check if all lines in a torch tensor have the same length when called at a line break position."""
+        """ Check if lenth of last line is the same as first line."""
         tensor = tensor[0]
         if tensor[-1].item() != 12: # only check if the last token is a line break
             return True
         idx = (tensor == 12).nonzero(as_tuple=True)[0]
         if len(idx) <= 1:
             return True
-        return len(torch.unique(idx[1:] - idx[:-1])) == 1
-        
+        return (idx[-2] - idx[-1] - 1) == idx[0]
+    
+    @staticmethod
+    def check_row_col_len(tensor, max_col=30, max_row=30, line_break_token=12):
+        # Find all line break positions
+        tensor = tensor[0]
+        line_breaks = (tensor == line_break_token).nonzero(as_tuple=True)[0]
+        num_rows = len(line_breaks)
+        if tensor[-1] != line_break_token:
+            num_rows += 1 # ongoing line
+        if num_rows > max_row:
+            return True  # Too many rows
+        # Find start of last row (after previous line break or at 0)
+        if num_rows == 0:
+            last_row_start = 0
+        else:
+            last_row_start = line_breaks[-1].item() + 1
+        last_row_end = len(tensor)
+        last_row_length = last_row_end - last_row_start
+        if last_row_length > max_col:
+            return True  # Last row is too long
+        return False  # All checks passed
+
     @torch.no_grad()
     def dfs_generate(self, current_ids, current_nll = 0, past_key_values = None, current_depth = 0):
         """Performs Depth-First Search to find the lowest NLL completion."""
@@ -888,12 +924,10 @@ class CausalDecoder(object):
                 use_cache=True, # Crucial for efficiency
             )
 
-        logits = outputs.logits.float() # Shape: (1, input_seq_len, vocab_size)
         new_past_key_values = outputs.past_key_values # Updated KV cache
 
         # Get logits for the *next* token prediction
-        # Logits shape is (batch_size, sequence_length, vocab_size)
-        next_token_logits = logits[:, -1, :]
+        next_token_logits = outputs.logits[:, -1, :].float() # Shape: (1, input_seq_len, vocab_size)
 
         # Calculate log probabilities and negative log likelihoods
         log_probs = torch.log_softmax(next_token_logits, dim=-1)
@@ -932,14 +966,18 @@ class CausalDecoder(object):
                 continue
             
             # --- Base Case: EOS token ---
-            if next_token_id == 14 and next_ids[0][-1].item() == 12: # Line break followed by EOS
-                # print(f"Found EOS. Path NLL: {potential_total_nll:.4f} | Path Len: {current_depth}",next_ids[0].tolist())
-                self.best_paths.append(next_ids[0].tolist())
-                self.nlls.append(potential_total_nll)
-                self.min_nll = min(self.min_nll, potential_total_nll)
-                # Continue searching other branches even after finding an EOS
+            if next_token_id == 14: 
+                if next_ids[0][-1].item() == 12: # Line break followed by EOS
+                    # print(f"Found EOS. Path NLL: {potential_total_nll:.4f} | Path Len: {current_depth}",next_ids[0].tolist())
+                    self.best_paths.append(next_ids[0].tolist())
+                    self.nlls.append(potential_total_nll)
+                    self.min_nll = min(self.min_nll, potential_total_nll)
+                # Continue searching other branches after finding an EOS for this path
                 continue # Don't recurse further down this path
-
+            
+            if self.check_equal_line_lengths(next_ids):
+                # skip going deeper when too many rows or cols
+                continue
             # --- Recursive Step ---
             # Pass the `new_past_key_values` which contains the cache state *after*
             self.dfs_generate(current_ids=next_ids,
