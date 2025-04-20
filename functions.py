@@ -50,11 +50,12 @@ class GlobalConfig:
         if self.tokenization not in ('causal', 'oneshot'):
             raise ValueError(f"Invalid tokenization: {self.tokenization}. Must be 'causal' or 'oneshot'.")
         save_path = '../../Model/model_' + self.find_largest_version()
-        if os.path.exists(save_path):
-            shutil.rmtree(save_path)
-            print(f"Deleted folder and contents: {save_path}")
-        os.makedirs(save_path)
-        print(f"Created folder: {save_path}")
+        # if os.path.exists(save_path):
+        #     shutil.rmtree(save_path)
+        #     print(f"Deleted folder and contents: {save_path}")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+            print(f"Created folder: {save_path}")
         self.folder = save_path + '/'
         if self.tokenization == 'causal':
             self.tokenizer = tokenize_causal
@@ -153,6 +154,9 @@ def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None
     if saved_path is not None:
         model.lm_head.load_state_dict(torch.load(saved_path + 'lm_heads_weights.pth'))
         model = PeftModel.from_pretrained(model, saved_path + 'finetuned_model', is_trainable=isTrain)
+    else:
+        # start from pretrained model
+        model.lm_head.load_state_dict(torch.load(f"/home/zhenlan/Desktop/Projects/ARC2/Model/gemma{head_dim}.pth"))
     if not isTrain:
         FastLanguageModel.for_inference(model);
     if NeedPosition:
@@ -682,6 +686,53 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
         # Tokenize the task
         out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition)
         yield out
+
+def tokenize_VLM(task, processor, max_pairs=4):
+    """
+    Encodes an ARC AGI task for a VLM.
+    
+    Args:
+        task: List of tuples [(input1, output1), (input2, output2), ...], where each input and output
+              is a 2D grid (list of lists) of integers between 0 and 9.
+        processor: A processor object for encoding images and text.
+    
+    Returns:
+        tuple: (images, task_str)
+            - images: List of numpy arrays [input1_image, output1_image, input2_image, ...], each of shape (H, W, 3)
+            - task_str: String representation of the task with image placeholders
+    """
+    # Color mappings
+    color_name = {
+        0: " red", 1: " blue", 2: " green", 3: " yellow", 4: " orange",
+        5: " purple", 6: " white", 7: " black", 8: " gray", 9: " brown"
+    }
+    color_rgb = {
+        0: (255, 0, 0), 1: (0, 0, 255), 2: (0, 255, 0), 3: (255, 255, 0), 4: (255, 165, 0),
+        5: (128, 0, 128), 6: (255, 255, 255), 7: (0, 0, 0), 8: (128, 128, 128), 9: (165, 42, 42)
+    }
+    color_array = np.array([color_rgb[i] for i in range(10)], dtype=np.uint8)
+
+    images = []
+    task_str = ""
+
+    # Process each input-output pair
+    for input_grid, output_grid in task[:max_pairs]:
+        # Convert grids to images
+        input_image = color_array[np.array(input_grid, dtype=int)]
+        output_image = color_array[np.array(output_grid, dtype=int)]
+        images.extend([input_image, output_image])
+
+        # Convert grids to string representations
+        input_str = "\n".join(["".join([color_name[cell] for cell in row]) for row in input_grid]) + "\n"
+        output_str = "\n".join(["".join([color_name[cell] for cell in row]) for row in output_grid]) + "\n"
+
+        # Build the task string for this pair
+        task_str += f" input{input_str}<start_of_image> output{output_str}<start_of_image>"
+    inputs = processor(text=task_str, images=images, return_tensors="pt")
+    return {'input_ids': inputs['input_ids'].to('cuda'), \
+            'pixel_values': inputs['pixel_values'].to('cuda'), \
+            'token_type_ids': inputs['token_type_ids'].to('cuda'), \
+            'attention_mask': inputs['attention_mask'].to('cuda')}
 
 class OneshotDecoder(object):
     def __init__(self, model, PosEmbedModel=None, max_dim=30):
