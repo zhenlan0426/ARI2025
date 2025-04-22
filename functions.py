@@ -653,7 +653,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False):
+def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, **kwargs):
     """Generate data for training or testing.
     
     Args:
@@ -684,8 +684,31 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
-        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition)
+        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition, **kwargs)
         yield out
+
+def post_process(input_ids):
+    """
+    create target based on input_ids
+    """
+    image_token_id = [255999, 262144]
+    input_output = [2744, 3938]
+    target = []
+    i = 0
+    while i < len(input_ids):
+        # Check if current token starts a section
+        if input_ids[i] in input_output:
+            i += 1  # Move past "input" or "output"
+            # Collect tokens until image token
+            while input_ids[i] not in image_token_id:
+                target.append(input_ids[i])
+                i += 1
+            target.append(-100) # shifted target
+        else:
+            # Non-section token (e.g., image token outside section)
+            target.append(-100)
+            i += 1
+    return target
 
 def tokenize_VLM(task, processor, max_pairs=4):
     """
@@ -732,7 +755,8 @@ def tokenize_VLM(task, processor, max_pairs=4):
     return {'input_ids': inputs['input_ids'].to('cuda'), \
             'pixel_values': inputs['pixel_values'].to('cuda'), \
             'token_type_ids': inputs['token_type_ids'].to('cuda'), \
-            'attention_mask': inputs['attention_mask'].to('cuda')}
+            'attention_mask': inputs['attention_mask'].to('cuda')},\
+           numpy2torch(post_process(inputs['input_ids'][0].tolist()))
 
 class OneshotDecoder(object):
     def __init__(self, model, PosEmbedModel=None, max_dim=30):
