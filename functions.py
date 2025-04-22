@@ -653,7 +653,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, **kwargs):
+def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False):
     """Generate data for training or testing.
     
     Args:
@@ -684,7 +684,27 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
-        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition, **kwargs)
+        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition)
+        yield out
+
+def data_gen_VLM(data, IsTrain, processor, max_pairs):
+    """Generate data for VLM
+    """
+    # Select dataset split
+    dataset = data['train'] if IsTrain else data['test']
+    
+    # Shuffle training data
+    if IsTrain:
+        random.shuffle(dataset)
+    
+    for task in dataset:
+        # Apply transformations only during training
+        if IsTrain:
+            # TODO: tansformation for decode
+            task = forwardTask(task, generateTransformPara(len(task)))
+        
+        # Tokenize the task
+        out = tokenize_VLM(task, processor, max_pairs=max_pairs)
         yield out
 
 def post_process(input_ids):
@@ -742,7 +762,10 @@ def tokenize_VLM(task, processor, max_pairs=4):
     for input_grid, output_grid in task[:max_pairs]:
         # Convert grids to images
         input_image = color_array[np.array(input_grid, dtype=int)]
+        # switch from (H, W, 3) to (3, H, W)
+        input_image = np.transpose(input_image, (2, 0, 1))
         output_image = color_array[np.array(output_grid, dtype=int)]
+        output_image = np.transpose(output_image, (2, 0, 1))
         images.extend([input_image, output_image])
 
         # Convert grids to string representations
