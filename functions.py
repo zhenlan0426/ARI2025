@@ -744,42 +744,81 @@ def tokenize_VLM(task, processor, max_pairs=4):
             - images: List of numpy arrays [input1_image, output1_image, input2_image, ...], each of shape (H, W, 3)
             - task_str: String representation of the task with image placeholders
     """
+    
+    BOS_TOKEN_IDX = 10
+    INPUT_TOKEN_IDX = 11
+    OUTPUT_TOKEN_IDX = 12
+    NEWLINE_TOKEN_IDX = 13
+    EOLINE_TOKEN_IDX = 14
+    BEG_OF_IMAGE_TOKEN_IDX = 15
+    IMAGE_SOFT_TOKEN_IDX = 16
+    END_OF_IMAGE_TOKEN_IDX = 17
+    IGNORE_INDEX = -100
+
     # Color mappings
-    color_name = {
-        0: " red", 1: " blue", 2: " green", 3: " yellow", 4: " orange",
-        5: " purple", 6: " white", 7: " black", 8: " gray", 9: " brown"
-    }
-    color_rgb = {
-        0: (255, 0, 0), 1: (0, 0, 255), 2: (0, 255, 0), 3: (255, 255, 0), 4: (255, 165, 0),
-        5: (128, 0, 128), 6: (255, 255, 255), 7: (0, 0, 0), 8: (128, 128, 128), 9: (165, 42, 42)
-    }
-    color_array = np.array([color_rgb[i] for i in range(10)], dtype=np.uint8)
+    color_array = np.array([[255,   0,   0],
+                            [  0,   0, 255],
+                            [  0, 255,   0],
+                            [255, 255,   0],
+                            [255, 165,   0],
+                            [128,   0, 128],
+                            [255, 255, 255],
+                            [  0, 255, 255],
+                            [128, 128, 128],
+                            [165,  42,  42]])
 
     images = []
-    task_str = ""
+    token_type_ids = [0]
+    target_ids = [IGNORE_INDEX]
+    input_ids = [BOS_TOKEN_IDX]
+    # TODO: 256 needs to be customized
+    image_token = [BEG_OF_IMAGE_TOKEN_IDX] + [IMAGE_SOFT_TOKEN_IDX] * 256 + [END_OF_IMAGE_TOKEN_IDX]
+
+    def process_grid(grid, isInput):
+        grid = np.array(grid, dtype=int)
+        grid = np.concatenate([grid, np.full((grid.shape[0], 1), NEWLINE_TOKEN_IDX)], axis=1)
+        grid = grid.flatten()
+        grid[-1] = EOLINE_TOKEN_IDX
+        input_ids = [INPUT_TOKEN_IDX if isInput else OUTPUT_TOKEN_IDX]
+        input_ids.extend(grid.tolist())
+        targets = input_ids[1:] + [IGNORE_INDEX]
+        token_type_ids = [0] * len(input_ids) # non-image tokens
+        # add image token
+        input_ids.extend(image_token)
+        token_type_ids.append(0) # BEG_OF_IMAGE_TOKEN_IDX
+        token_type_ids.extend([1] * (len(image_token) - 2))
+        token_type_ids.append(0) # END_OF_IMAGE_TOKEN_IDX
+        targets.extend([IGNORE_INDEX] * len(image_token))
+        return input_ids, targets, token_type_ids
 
     # Process each input-output pair
     for input_grid, output_grid in task[:max_pairs]:
         # Convert grids to images
         input_image = color_array[np.array(input_grid, dtype=int)]
-        # switch from (H, W, 3) to (3, H, W)
-        input_image = np.transpose(input_image, (2, 0, 1))
+        input_image = np.transpose(input_image, (2, 0, 1)) # switch from (H, W, 3) to (3, H, W)
         output_image = color_array[np.array(output_grid, dtype=int)]
         output_image = np.transpose(output_image, (2, 0, 1))
         images.extend([input_image, output_image])
 
-        # Convert grids to string representations
-        input_str = "\n".join(["".join([color_name[cell] for cell in row]) for row in input_grid]) + "\n"
-        output_str = "\n".join(["".join([color_name[cell] for cell in row]) for row in output_grid]) + "\n"
-
-        # Build the task string for this pair
-        task_str += f" input{input_str}<start_of_image> output{output_str}<start_of_image>"
-    inputs = processor(text=task_str, images=images, return_tensors="pt")
-    return {'input_ids': inputs['input_ids'].to('cuda'), \
-            'pixel_values': inputs['pixel_values'].to('cuda'), \
-            'token_type_ids': inputs['token_type_ids'].to('cuda'), \
-            'attention_mask': inputs['attention_mask'].to('cuda')},\
-           numpy2torch(post_process(inputs['input_ids'][0].tolist()))
+        # Convert grids to input_ids
+        # input grid
+        input_grid, target, token_type = process_grid(input_grid, isInput=True)
+        input_ids.extend(input_grid)
+        target_ids.extend(target)
+        token_type_ids.extend(token_type)
+        # output grid
+        output_grid, target, token_type = process_grid(output_grid, isInput=False)
+        input_ids.extend(output_grid)
+        target_ids.extend(target)
+        token_type_ids.extend(token_type)
+        
+    images = processor.image_processor.preprocess(images, return_tensors="pt", data_format="channels_first",input_data_format="channels_first")
+    return {'input_ids': numpy2torch(input_ids), \
+            'pixel_values': images['pixel_values'].to('cuda'), \
+            'token_type_ids': numpy2torch(token_type_ids), \
+            'attention_mask': numpy2torch([1] * len(input_ids)), \
+           },\
+           numpy2torch(target_ids)
 
 class OneshotDecoder(object):
     def __init__(self, model, PosEmbedModel=None, max_dim=30):
