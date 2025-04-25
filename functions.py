@@ -707,108 +707,108 @@ def data_gen_VLM(data, IsTrain, processor, max_pairs):
         out = tokenize_VLM(task, processor, max_pairs=max_pairs)
         yield out
 
-# def tokenize_VLM(task, processor, max_pairs=4, multiplier=14):
-#     """
-#     this version works with list of various sized images
-#     """
+def tokenize_VLM(task, processor, max_pairs=4, multiplier=14):
+    """
+    this version works with list of various sized images
+    """
     
-#     BOS_TOKEN_IDX = 10
-#     INPUT_TOKEN_IDX = 11
-#     OUTPUT_TOKEN_IDX = 12
-#     NEWLINE_TOKEN_IDX = 13
-#     EOLINE_TOKEN_IDX = 14
-#     BEG_OF_IMAGE_TOKEN_IDX = 15
-#     IMAGE_SOFT_TOKEN_IDX = 16
-#     END_OF_IMAGE_TOKEN_IDX = 17
-#     IGNORE_INDEX = -100
+    BOS_TOKEN_IDX = 10
+    INPUT_TOKEN_IDX = 11
+    OUTPUT_TOKEN_IDX = 12
+    NEWLINE_TOKEN_IDX = 13
+    EOLINE_TOKEN_IDX = 14
+    BEG_OF_IMAGE_TOKEN_IDX = 15
+    IMAGE_SOFT_TOKEN_IDX = 16
+    END_OF_IMAGE_TOKEN_IDX = 17
+    IGNORE_INDEX = -100
 
-#     # Color mappings
-#     color_array = np.array([[255,   0,   0],
-#                             [  0,   0, 255],
-#                             [  0, 255,   0],
-#                             [255, 255,   0],
-#                             [255, 165,   0],
-#                             [128,   0, 128],
-#                             [255, 255, 255],
-#                             [  0, 255, 255],
-#                             [128, 128, 128],
-#                             [165,  42,  42]])
+    # Color mappings
+    color_array = np.array([[255,   0,   0],
+                            [  0,   0, 255],
+                            [  0, 255,   0],
+                            [255, 255,   0],
+                            [255, 165,   0],
+                            [128,   0, 128],
+                            [255, 255, 255],
+                            [  0, 255, 255],
+                            [128, 128, 128],
+                            [165,  42,  42]])
 
-#     images = []
-#     token_type_ids = [0]
-#     target_ids = [IGNORE_INDEX]
-#     input_ids = [BOS_TOKEN_IDX]
+    images = []
+    token_type_ids = [0]
+    target_ids = [IGNORE_INDEX]
+    input_ids = [BOS_TOKEN_IDX]
 
-#     def scale_image(image: List[List[int]], k: int) -> List[List[int]]:
-#         scaled_image = [
-#             # 1. Create the expanded row (scale horizontally)
-#             [pixel for pixel in original_row for _ in range(k)]
-#             # 2. Iterate through original rows
-#             for original_row in image
-#             # 3. Repeat each expanded row k times (scale vertically)
-#             for _ in range(k)
-#         ]
-#         return scaled_image
+    def scale_image(image: List[List[int]], k: int) -> List[List[int]]:
+        scaled_image = [
+            # 1. Create the expanded row (scale horizontally)
+            [pixel for pixel in original_row for _ in range(k)]
+            # 2. Iterate through original rows
+            for original_row in image
+            # 3. Repeat each expanded row k times (scale vertically)
+            for _ in range(k)
+        ]
+        return scaled_image
     
-#     def process_grid(grid, isInput,image_token):
-#         grid = np.array(grid, dtype=int)
-#         grid = np.concatenate([grid, np.full((grid.shape[0], 1), NEWLINE_TOKEN_IDX)], axis=1)
-#         grid = grid.flatten()
-#         grid[-1] = EOLINE_TOKEN_IDX
-#         input_ids = [INPUT_TOKEN_IDX if isInput else OUTPUT_TOKEN_IDX]
-#         input_ids.extend(grid.tolist())
-#         targets = input_ids[1:] + [IGNORE_INDEX]
-#         token_type_ids = [0] * len(input_ids) # non-image tokens
-#         # add image token
-#         input_ids.extend(image_token)
-#         token_type_ids.append(0) # BEG_OF_IMAGE_TOKEN_IDX
-#         token_type_ids.extend([1] * (len(image_token) - 2))
-#         token_type_ids.append(0) # END_OF_IMAGE_TOKEN_IDX
-#         targets.extend([IGNORE_INDEX] * len(image_token))
-#         return input_ids, targets, token_type_ids
+    def process_grid(grid, isInput,image_token):
+        grid = np.array(grid, dtype=int)
+        grid = np.concatenate([grid, np.full((grid.shape[0], 1), NEWLINE_TOKEN_IDX)], axis=1)
+        grid = grid.flatten()
+        grid[-1] = EOLINE_TOKEN_IDX
+        input_ids = [INPUT_TOKEN_IDX if isInput else OUTPUT_TOKEN_IDX]
+        input_ids.extend(grid.tolist())
+        targets = input_ids[1:] + [IGNORE_INDEX]
+        token_type_ids = [0] * len(input_ids) # non-image tokens
+        # add image token
+        input_ids.extend(image_token)
+        token_type_ids.append(0) # BEG_OF_IMAGE_TOKEN_IDX
+        token_type_ids.extend([1] * (len(image_token) - 2))
+        token_type_ids.append(0) # END_OF_IMAGE_TOKEN_IDX
+        targets.extend([IGNORE_INDEX] * len(image_token))
+        return input_ids, targets, token_type_ids
 
-#     def process_image(grid, multiplier):
-#         # return image of shape (1, 3, H, W)
-#         grid = scale_image(grid, multiplier)
-#         images = color_array[np.array(grid, dtype=int)]
-#         images = np.transpose(images, (2, 0, 1)) # switch from (H, W, 3) to (3, H, W)
-#         return processor.image_processor.preprocess(images, return_tensors="pt", \
-#                                                     data_format="channels_first",input_data_format="channels_first",\
-#                                                     do_resize=False)['pixel_values'].to('cuda')
-#     def create_image_token(grid, multiplier):
-#         l, w = len(grid), len(grid[0])
-#         r, c = l * multiplier // 14, w * multiplier // 14
-#         return [BEG_OF_IMAGE_TOKEN_IDX] + [IMAGE_SOFT_TOKEN_IDX] * r * c + [END_OF_IMAGE_TOKEN_IDX]
+    def process_image(grid, multiplier):
+        # return image of shape (1, 3, H, W)
+        grid = scale_image(grid, multiplier)
+        images = color_array[np.array(grid, dtype=int)]
+        images = np.transpose(images, (2, 0, 1)) # switch from (H, W, 3) to (3, H, W)
+        return processor.image_processor.preprocess(images, return_tensors="pt", \
+                                                    data_format="channels_first",input_data_format="channels_first",\
+                                                    do_resize=False)['pixel_values'].to('cuda')
+    def create_image_token(grid, multiplier):
+        l, w = len(grid), len(grid[0])
+        r, c = l * multiplier // 14, w * multiplier // 14
+        return [BEG_OF_IMAGE_TOKEN_IDX] + [IMAGE_SOFT_TOKEN_IDX] * r * c + [END_OF_IMAGE_TOKEN_IDX]
 
-#     # Process each input-output pair
-#     for input_grid, output_grid in task[:max_pairs]:
-#         # Convert grids to images
-#         input_image = process_image(input_grid, multiplier)
-#         output_image = process_image(output_grid, multiplier)
-#         images.extend([input_image, output_image])
-#         input_image_token = create_image_token(input_grid, multiplier)
-#         output_image_token = create_image_token(output_grid, multiplier)
+    # Process each input-output pair
+    for input_grid, output_grid in task[:max_pairs]:
+        # Convert grids to images
+        input_image = process_image(input_grid, multiplier)
+        output_image = process_image(output_grid, multiplier)
+        images.extend([input_image, output_image])
+        input_image_token = create_image_token(input_grid, multiplier)
+        output_image_token = create_image_token(output_grid, multiplier)
 
-#         # Convert grids to input_ids
-#         # input grid
-#         input_grid, target, token_type = process_grid(input_grid, isInput=True, image_token=input_image_token)
-#         input_ids.extend(input_grid)
-#         target_ids.extend(target)
-#         token_type_ids.extend(token_type)
-#         # output grid
-#         output_grid, target, token_type = process_grid(output_grid, isInput=False, image_token=output_image_token)
-#         input_ids.extend(output_grid)
-#         target_ids.extend(target)
-#         token_type_ids.extend(token_type)
+        # Convert grids to input_ids
+        # input grid
+        input_grid, target, token_type = process_grid(input_grid, isInput=True, image_token=input_image_token)
+        input_ids.extend(input_grid)
+        target_ids.extend(target)
+        token_type_ids.extend(token_type)
+        # output grid
+        output_grid, target, token_type = process_grid(output_grid, isInput=False, image_token=output_image_token)
+        input_ids.extend(output_grid)
+        target_ids.extend(target)
+        token_type_ids.extend(token_type)
         
-#     return {'input_ids': numpy2torch(input_ids), \
-#             'pixel_values': images, \
-#             'token_type_ids': numpy2torch(token_type_ids), \
-#             'attention_mask': numpy2torch([1] * len(input_ids)), \
-#            },\
-#            numpy2torch(target_ids)
+    return {'input_ids': numpy2torch(input_ids), \
+            'pixel_values': images, \
+            'token_type_ids': numpy2torch(token_type_ids), \
+            'attention_mask': numpy2torch([1] * len(input_ids)), \
+           },\
+           numpy2torch(target_ids)
 
-def tokenize_VLM(task, processor, max_pairs=4):
+def tokenize_VLM_old(task, processor, max_pairs=4):
     """
     Encodes an ARC AGI task for a VLM.
     
