@@ -723,10 +723,8 @@ def tokenize_VLM(task, processor, max_pairs=4, multiplier=14, decode=False):
                    Defaults to 4.
         multiplier: The integer factor used to scale the height and width of the grids
                     before image processing. Defaults to 14.
-        decode: If True, the function prepares input for generation/decoding. The target
-                returned will be the raw final `output_grid` instead of processed target IDs.
-                If False (default), the function prepares input and labels for training,
-                and the target returned will be a tensor of target token IDs.
+        decode: If True, return processed [x1, image_x1, y1, image_y1,... xk, image_xk, OUTPUT_TOKEN_IDX]
+                If False (default), return processed [x1, image_x1, y1, image_y1,... xk, image_xk, yk]
 
     Returns:
         A tuple containing:
@@ -742,7 +740,7 @@ def tokenize_VLM(task, processor, max_pairs=4, multiplier=14, decode=False):
         - The target data:
             - If `decode` is False: A tensor of target token IDs, used for training (loss calculation).
                                    Contains IGNORE_INDEX (-100) for non-target tokens.
-            - If `decode` is True: The raw `output_grid` (List[List[int]]) from the final pair.
+            - If `decode` is True: The raw `output_grid` np.array from the final pair.
 
     """
     
@@ -794,11 +792,12 @@ def tokenize_VLM(task, processor, max_pairs=4, multiplier=14, decode=False):
         targets = input_ids[1:] + [IGNORE_INDEX]
         token_type_ids = [0] * len(input_ids) # non-image tokens
         # add image token
-        input_ids.extend(image_token)
-        token_type_ids.append(0) # BEG_OF_IMAGE_TOKEN_IDX
-        token_type_ids.extend([1] * (len(image_token) - 2))
-        token_type_ids.append(0) # END_OF_IMAGE_TOKEN_IDX
-        targets.extend([IGNORE_INDEX] * len(image_token))
+        if image_token is not None:
+            input_ids.extend(image_token)
+            token_type_ids.append(0) # BEG_OF_IMAGE_TOKEN_IDX
+            token_type_ids.extend([1] * (len(image_token) - 2))
+            token_type_ids.append(0) # END_OF_IMAGE_TOKEN_IDX
+            targets.extend([IGNORE_INDEX] * len(image_token))
         return input_ids, targets, token_type_ids
 
     def process_image(grid, multiplier):
@@ -814,9 +813,13 @@ def tokenize_VLM(task, processor, max_pairs=4, multiplier=14, decode=False):
         r, c = l * multiplier // 14, w * multiplier // 14
         return [BEG_OF_IMAGE_TOKEN_IDX] + [IMAGE_SOFT_TOKEN_IDX] * r * c + [END_OF_IMAGE_TOKEN_IDX]
 
-    def process_all(grid, isInput, multiplier):
-        image = process_image(grid, multiplier)
-        image_token = create_image_token(grid, multiplier)
+    def process_all(grid, isInput, multiplier, isLast=False):
+        # dont need to return image for last output grid
+        if not isLast:
+            image = process_image(grid, multiplier)
+            image_token = create_image_token(grid, multiplier)
+        else:
+            image, image_token = None, None
         ids, target, type = process_grid(grid, isInput, image_token)
         return image, ids, target, type
     
@@ -847,13 +850,15 @@ def tokenize_VLM(task, processor, max_pairs=4, multiplier=14, decode=False):
     token_type_ids.extend(type)
     # output
     if not decode:
-        image, ids, target, type = process_all(output_grid, isInput=False, multiplier=multiplier)
-        images.append(image)
+        image, ids, target, type = process_all(output_grid, isInput=False, multiplier=multiplier, isLast=True)
         input_ids.extend(ids)
         target_ids.extend(target)
         token_type_ids.extend(type)
     else:
-        target_ids = output_grid
+        # start with output token for decoding
+        input_ids.append(OUTPUT_TOKEN_IDX)
+        token_type_ids.append(0)
+        target_ids = np.array(output_grid) if output_grid is not None else None
         
     return {'input_ids': numpy2torch(input_ids), \
             'pixel_values': images, \
