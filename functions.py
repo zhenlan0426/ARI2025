@@ -1044,7 +1044,7 @@ def data_gen_VLM(data, IsTrain, processor, max_pairs, decode=False, tokenize_fun
         out = tokenize_func(task, processor, max_pairs=max_pairs, decode=decode)
         yield out
 
-# def tokenize_VLM(task, processor, max_pairs=4):
+# def tokenize_VLM_full_image(task, processor, max_pairs=4, decode=False):
 #     """
 #     fixed size image by scaling.
     
@@ -1059,27 +1059,27 @@ def data_gen_VLM(data, IsTrain, processor, max_pairs, decode=False, tokenize_fun
 #             - task_str: String representation of the task with image placeholders
 #     """
     
-    BOS_TOKEN_IDX = 10
-    INPUT_TOKEN_IDX = 11
-    OUTPUT_TOKEN_IDX = 12
-    NEWLINE_TOKEN_IDX = 13
-    EOLINE_TOKEN_IDX = 14
-    BEG_OF_IMAGE_TOKEN_IDX = 15
-    IMAGE_SOFT_TOKEN_IDX = 16
-    END_OF_IMAGE_TOKEN_IDX = 17
-    IGNORE_INDEX = -100
+#     BOS_TOKEN_IDX = 10
+#     INPUT_TOKEN_IDX = 11
+#     OUTPUT_TOKEN_IDX = 12
+#     NEWLINE_TOKEN_IDX = 13
+#     EOLINE_TOKEN_IDX = 14
+#     BEG_OF_IMAGE_TOKEN_IDX = 15
+#     IMAGE_SOFT_TOKEN_IDX = 16
+#     END_OF_IMAGE_TOKEN_IDX = 17
+#     IGNORE_INDEX = -100
 
-    # Color mappings
-    color_array = np.array([[255,   0,   0],
-                            [  0,   0, 255],
-                            [  0, 255,   0],
-                            [255, 255,   0],
-                            [255, 165,   0],
-                            [128,   0, 128],
-                            [255, 255, 255],
-                            [  0, 255, 255],
-                            [128, 128, 128],
-                            [165,  42,  42]])
+#     # Color mappings
+#     color_array = np.array([[255,   0,   0],
+#                             [  0,   0, 255],
+#                             [  0, 255,   0],
+#                             [255, 255,   0],
+#                             [255, 165,   0],
+#                             [128,   0, 128],
+#                             [255, 255, 255],
+#                             [  0, 255, 255],
+#                             [128, 128, 128],
+#                             [165,  42,  42]])
 
 #     images = []
 #     token_type_ids = [0]
