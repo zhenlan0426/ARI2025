@@ -687,6 +687,12 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
         out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition)
         yield out
 
+def create_attention_mask(length: int) -> torch.Tensor:
+  mask = torch.zeros(length, length, dtype=torch.bfloat16, device='cuda')
+  is_upper_triangle = torch.triu(torch.ones(length, length, dtype=torch.bool, device='cuda'), diagonal=1)
+  mask[is_upper_triangle] = torch.finfo(torch.bfloat16).min
+  return mask.unsqueeze(0).unsqueeze(0)
+
 def tokenize_VLM(task, processor, max_pairs=4, multiplier=14, decode=False):
     """
     This function takes a list of input-output grid pairs (ARC),
@@ -842,8 +848,8 @@ def tokenize_VLM(task, processor, max_pairs=4, multiplier=14, decode=False):
         
     return {'input_ids': numpy2torch(input_ids), \
             'pixel_values': images, \
-            'token_type_ids': numpy2torch(token_type_ids), \
-            'attention_mask': numpy2torch([1] * len(input_ids)), \
+            # 'token_type_ids': numpy2torch(token_type_ids), \
+            # 'attention_mask': numpy2torch([1] * len(input_ids)), \
            },\
            target_ids if decode else numpy2torch(target_ids)
 
@@ -1019,17 +1025,17 @@ def tokenize_VLM_oneshot(task, processor, max_pairs=4, multiplier=14, decode=Fal
         
     return {'input_ids': numpy2torch(input_ids), \
             'pixel_values': images, \
-            'token_type_ids': numpy2torch(token_type_ids), \
-            'attention_mask': numpy2torch([1] * len(input_ids)), \
+            # 'token_type_ids': numpy2torch(token_type_ids), \
+            # 'attention_mask': numpy2torch([1] * len(input_ids)), \
            },\
            target_ids if decode else numpy2torch(target_ids), l
 
-def data_gen_VLM(data, IsTrain, processor, max_pairs, decode=False, tokenize_func=tokenize_VLM):
+def data_gen_VLM(data, IsTrain, processor, max_pairs, decode=False, tokenize_func=tokenize_VLM, max_len=8192):
     """Generate data for VLM
     """
     # Select dataset split
     dataset = data['train'] if IsTrain else data['test']
-    
+    attention_mask = create_attention_mask(max_len)
     # Shuffle training data
     if IsTrain:
         random.shuffle(dataset)
@@ -1041,8 +1047,10 @@ def data_gen_VLM(data, IsTrain, processor, max_pairs, decode=False, tokenize_fun
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
-        out = tokenize_func(task, processor, max_pairs=max_pairs, decode=decode)
-        yield out
+        inputs, *others = tokenize_func(task, processor, max_pairs=max_pairs, decode=decode)
+        l = inputs['input_ids'].shape[1]
+        inputs['attention_mask'] = attention_mask[:,:,:l,:l]
+        yield inputs, *others
 
 # def tokenize_VLM_full_image(task, processor, max_pairs=4, decode=False):
 #     """
