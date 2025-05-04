@@ -26,6 +26,8 @@
          ```python
             if self.is_sliding and attention_mask is not None:...
          ```
+
+         - pass in 4d causal attention mask to disable cross attention among images
       - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/unsloth_zoo/temporary_patches.py
          ```python        
             # if attention_mask is not None and self.config._attn_implementation == "flash_attention_2":
