@@ -38,6 +38,6 @@
          ```
    4. I am trying to solve ARC AGI problem using VLM. each task is represented as (input1, output1),(input2, output2),... (inputN, outputN), where input and output are 2d grid of integer between 0 and 9. Our goal is to given all history up till inputN, and predict outputN. 
    
-   I am to represent the input, output pair as both "text" and image. text representation would be flattened inputs/outputs with line separator (at end of each row) and token embedding and special token like line separator will be trained from scratch. image representation would be RGB of the 2d grid, where 0 ~ 9 each mapped to a unique color. then I will represent the input as a sequence, input_text1, input_image1, output_text1, output_image1, ... and target would be shifted input_text1, output_text1,... where images are ignored.
+      I am to represent the input, output pair as both "text" and image. text representation would be flattened inputs/outputs with line separator (at end of each row) and token embedding and special token like line separator will be trained from scratch. image representation would be RGB of the 2d grid, where 0 ~ 9 each mapped to a unique color. then I will represent the input as a sequence, input_text1, input_image1, output_text1, output_image1, ... and target would be shifted input_text1, output_text1,... where images are ignored.
 
 
