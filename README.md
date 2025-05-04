@@ -1,5 +1,5 @@
 #### ARI2025 - Lessons
-1. based on Fine_Tune copy 2, 3, 5. mask does not seem to matter. branch off from functions_old
+1. Based on Fine_Tune copy 2, 3, 5. mask does not seem to matter. branch off from functions_old
 2. BOS_Y -> row -> col does not work well as model predict row and then proceed to predict cell 1 as shown in
    Fine_Tune copy 4. row_special_token -> row and col_special_token -> col
 3. VLM modifications:
@@ -20,4 +20,17 @@
          ```python        
                image_features = [self.get_image_features(pixel_value) for pixel_value in pixel_values] # 1, l_i, h
                image_features = torch.cat(image_features, dim=1) # 1, l, h
+         ```
+
+         - disable sliding window attention (comment out line 389 code block)
+         ```python
+            if self.is_sliding and attention_mask is not None:...
+         ```
+      - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/unsloth_zoo/temporary_patches.py
+         ```python        
+            # if attention_mask is not None and self.config._attn_implementation == "flash_attention_2":
+            # needed to ensure that the attention mask is the same size as the key and value states
+            if attention_mask is not None:
+                  seq_len = attention_mask.shape[-1]
+                  key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
          ```

@@ -1030,7 +1030,7 @@ def tokenize_VLM_oneshot(task, processor, max_pairs=4, multiplier=14, decode=Fal
            },\
            target_ids if decode else numpy2torch(target_ids), l
 
-def data_gen_VLM(data, IsTrain, processor, max_pairs, decode=False, tokenize_func=tokenize_VLM, max_len=8192):
+def data_gen_VLM(data, IsTrain, processor, max_pairs, decode=False, tokenize_func=tokenize_VLM, max_len=12288):
     """Generate data for VLM
     """
     # Select dataset split
