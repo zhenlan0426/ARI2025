@@ -1270,6 +1270,46 @@ class OneshotDecoder(object):
         return output_grid
 
 class CausalDecoder(object):
+    """
+    A depth-first search (DFS) based sequence generator for transformer models.
+    **Args**:
+        - `model`: The pre-trained transformer model used for sequence generation.
+        - `max_depth` (int, optional): The maximum recursion depth for DFS generation. Defaults to `31 * 30 + 1`.
+        - `multiplier` (float, optional): A multiplier for pruning paths based on NLL. Paths with NLL >= `min_nll * multiplier` are discarded. Defaults to `1.3`.
+        - `prob_threshold` (float, optional): The cumulative probability threshold for stopping exploration of next tokens. Defaults to `0.8`.
+        - `max_num_path` (int, optional): The maximum number of complete paths to collect. Defaults to `10`.
+        - `IsDebug` (bool, optional): If `True`, enables debug logging. Defaults to `False`.
+
+    **Attributes**:
+        - `best_paths` (list): List of generated 2D grids, stored as numpy arrays.
+        - `nlls` (list): List of negative log likelihoods (NLLs) corresponding to `best_paths`.
+        - `min_nll` (float): The minimum NLL among the collected paths.
+
+    **Methods**:
+        - `decode(input_tokens, return_best_path)`:  
+            Generates sequences starting from the provided input tokens.  
+            **Args**:  
+                - `input_tokens`: A dictionary containing `'input_ids'` (torch.Tensor).  
+                - `return_best_path` (bool): If `True`, returns only the best path; otherwise, returns all collected paths.  
+            **Returns**:  
+                - If `return_best_path` is `True`: The best 2D grid (numpy array).  
+                - If `return_best_path` is `False`: A list of all collected 2D grids (list of numpy arrays).
+
+        - `reset()`:  
+            Resets the internal state, clearing `best_paths`, `nlls`, and `min_nll`.
+
+        - `detokenize_causal(tokens)`:  
+            Converts a 1D list of tokens into a 2D grid, interpreting `LINE_BREAK` and `EOS_Y` tokens.
+
+        - `check_equal_line_lengths(tensor)`:  
+            Ensures that if the sequence ends with a line break, the last line's length matches the first line's length.
+
+        - `check_row_col_len(tensor, max_col=30, max_row=30)`:  
+            Verifies that the number of rows and columns in the tensor does not exceed the specified limits.
+
+        - `dfs_generate(current_ids, current_seq_len, current_nll=0, past_key_values=None, current_depth=0)`:  
+            The recursive DFS method that generates and explores possible sequences.
+    """
     LINE_BREAK = 13
     EOS_Y = 14
     special_tokens = {LINE_BREAK, EOS_Y}
