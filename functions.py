@@ -4,7 +4,7 @@ import numpy as np
 import random
 import torch
 import torch.nn as nn
-from transformers import HybridCache
+from transformers import StaticCache
 from typing import List, Tuple, Optional
 import gc
 import os
@@ -1310,7 +1310,7 @@ class CausalDecoder(object):
         - `dfs_generate(current_ids, current_seq_len, current_nll=0, past_key_values=None, current_depth=0)`:  
             The recursive DFS method that generates and explores possible sequences.
     """
-    LINE_BREAK = 13
+    LINE_BREAK = 12
     EOS_Y = 14
     special_tokens = {LINE_BREAK, EOS_Y}
     def __init__(self, model, max_depth: int = 31 * 30 + 1, multiplier = 1.3, prob_threshold = 0.8, max_num_path = 10, IsDebug=False):
@@ -1353,7 +1353,7 @@ class CausalDecoder(object):
         for token in tokens:
             if token == CausalDecoder.EOS_Y:
                 if row:
-                    grid.append(row)
+                    grid.append(row) # this should not happen as line break is always followed by EOS_Y
                 break  # Stop at EOS_Y
             elif token == CausalDecoder.LINE_BREAK:
                 grid.append(row)
@@ -1366,21 +1366,29 @@ class CausalDecoder(object):
     def check_equal_line_lengths(tensor):
         """ Check if length of last line is the same as first line."""
         tensor = tensor[0]
-        if tensor[-1].item() not in CausalDecoder.special_tokens: # only check if the last token is a line break or EOS_Y
+        item = tensor[-1].item()
+        if item not in CausalDecoder.special_tokens: # only check if the last token is a line break or EOS_Y
             return True
         idx = (tensor == CausalDecoder.LINE_BREAK).nonzero(as_tuple=True)[0]
         if len(idx) <= 1: # first line
             return True
-        last_idx = idx[-1] if tensor[-1].item() == CausalDecoder.LINE_BREAK else len(tensor) - 1
-        return (last_idx - idx[-2] - 1) == idx[0]
+        if item == CausalDecoder.EOS_Y: # EOS_Y must be preceded by a line break and we dont need to check again 1, 2, line, 3, 4, line, EOS_Y
+            if tensor[-2].item() != CausalDecoder.LINE_BREAK:
+                return False
+            else:
+                return True # no need to check length as logic would fail
+        return (idx[-1] - idx[-2] - 1) == idx[0]
     
     @staticmethod
     def check_row_col_len(tensor, max_col=30, max_row=30):
         """ Check if the number of rows and columns in the tensor is within limits."""
         tensor = tensor[0]
+        item = tensor[-1].item()
+        if item == CausalDecoder.EOS_Y:
+            return True
         line_breaks = (tensor == CausalDecoder.LINE_BREAK).nonzero(as_tuple=True)[0]
         num_rows = len(line_breaks)
-        if tensor[-1] != CausalDecoder.LINE_BREAK:
+        if item != CausalDecoder.LINE_BREAK:
             num_rows += 1 # ongoing line
         if num_rows > max_row:
             return False  # Too many rows
@@ -1400,7 +1408,7 @@ class CausalDecoder(object):
         """Performs Depth-First Search to find good candidates."""
         # current_ids is torch.Tensor of Shape: (1, seq_len)
         if self.IsDebug:
-            print(f"Current NLL: {current_nll:.4f} | Path Len: {current_depth} | Current IDs: {current_ids[0].tolist()}")
+            print(f"Current NLL: {current_nll:.4f} | Path depth: {current_depth} | Current IDs: {current_ids[0][-1].item()}")
         model = self.model
         max_depth = self.max_depth
         device = model.device
@@ -1412,11 +1420,11 @@ class CausalDecoder(object):
         if current_depth == 0:
             # First call, process the whole sequence
             current_seq_len = current_ids['input_ids'].shape[1] - 1
-            past_key_values = HybridCache(model.config.text_config, 1, current_seq_len + 30 * 31 + 2)
+            past_key_values = StaticCache(model.config, 1, current_seq_len + 30 * 31 + 2, device='cuda')
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                outputs = model(**current_ids,
+                outputs = model(current_ids['input_tokens'],
                                 use_cache=True,
-                                past_key_values=past_key_values,
+                                past_key_values=past_key_values
                                )
         else:
             # Subsequent calls, only process the last token
