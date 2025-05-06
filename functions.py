@@ -15,6 +15,7 @@ import json
 from dataclasses import asdict
 from dataclasses import dataclass, field
 from peft import PeftModel
+import math
 
 ''' ---------------------------- Model utilities ----------------------------- '''
 @dataclass
@@ -396,11 +397,16 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
             target_tokens = target_tokens[1:] + [PAD_TOKEN]
     
     # Convert to numpy arrays
-    if NeedPosition:
-        return {"input_tokens":numpy2torch(input_tokens), "target_tokens": numpy2torch(target_tokens) if target_tokens is not None else None, \
-                "row_indices": numpy2torch(row_indices), "col_indices": numpy2torch(col_indices)}
+    out = dict()
+    out["input_tokens"] = numpy2torch(input_tokens)
+    if IsDecode:
+        out["target_tokens"] = np.array(target_tokens) if target_tokens is not None else None
     else:
-        return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None}
+        out["target_tokens"] = numpy2torch(target_tokens)
+    if NeedPosition:
+        out["row_indices"] = numpy2torch(row_indices)
+        out["col_indices"] = numpy2torch(col_indices)
+    return out
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                      max_length:int,\
@@ -1393,10 +1399,10 @@ class CausalDecoder(object):
         if num_rows > max_row:
             return False  # Too many rows
         # Find start of last row (after previous line break or at 0)
-        if num_rows == 0:
+        if len(line_breaks) == 0:
             last_row_start = 0
         else:
-            last_row_start = line_breaks[-1].item() + 1
+            last_row_start = line_breaks[-1] + 1
         last_row_end = len(tensor)
         last_row_length = last_row_end - last_row_start
         if last_row_length > max_col:
@@ -1405,9 +1411,11 @@ class CausalDecoder(object):
 
     @torch.no_grad()
     def dfs_generate(self, current_ids, current_seq_len = 0, current_nll = 0, past_key_values = None, current_depth = 0):
-        """Performs Depth-First Search to find good candidates."""
+        """Performs Depth-First Search to find good candidates. 
+           cache position is needed to "un-do" (backtrack) changes made to past_key_values in deeper dfs
+        """
         # current_ids is torch.Tensor of Shape: (1, seq_len)
-        if self.IsDebug:
+        if self.IsDebug and current_depth > 0:
             print(f"Current NLL: {current_nll:.4f} | Path depth: {current_depth} | Current IDs: {current_ids[0][-1].item()}")
         model = self.model
         max_depth = self.max_depth
@@ -1419,7 +1427,7 @@ class CausalDecoder(object):
         # Prepare inputs for the model
         if current_depth == 0:
             # First call, process the whole sequence
-            current_seq_len = current_ids['input_ids'].shape[1] - 1
+            current_seq_len = current_ids['input_tokens'].shape[1] - 1
             past_key_values = StaticCache(model.config, 1, current_seq_len + 30 * 31 + 2, device='cuda')
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 outputs = model(current_ids['input_tokens'],
@@ -1495,6 +1503,23 @@ class CausalDecoder(object):
                               current_depth=current_depth + 1,
                              )
 
-            cum_prob += torch.exp(-next_token_nll).item()
+            cum_prob += math.exp(-next_token_nll)
             if cum_prob >= self.prob_threshold:
                 break
+
+def check_grid(y, yhat):
+    # 0 shape mismatch
+    # 1 not equal
+    # 2 equal
+    a,b = y.shape
+    c,d = yhat.shape
+    if a != c or b != d:
+        return 0
+    else:
+        return (y == yhat).sum()/a/b
+    
+def check(decoder,targets):
+    idx = np.argmin(decoder.nlls)
+    best_res = check_grid(targets, decoder.best_paths[idx])
+    any_res = max((check_grid(targets, grid) for grid in decoder.best_paths))
+    return best_res, any_res
