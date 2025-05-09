@@ -37,6 +37,7 @@
                   key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
          ```
 4. I am trying to solve ARC AGI problem using VLM. each task is represented as (input1, output1),(input2, output2),... (inputN, outputN), where input and output are 2d grid of integer between 0 and 9. Our goal is to given all history up till inputN, and predict outputN. 
+<<<<<<< Updated upstream
 
 I am to represent the input, output pair as both "text" and image. text representation would be flattened inputs/outputs with line separator (at end of each row) and token embedding and special token like line separator will be trained from scratch. image representation would be RGB of the 2d grid, where 0 ~ 9 each mapped to a unique color. then I will represent the input as a sequence, input_text1, input_image1, output_text1, output_image1, ... and target would be shifted input_text1, output_text1,... where images are ignored.
 5. StaticCache Modifications
@@ -45,5 +46,23 @@ I am to represent the input, output pair as both "text" and image. text represen
       ```python        
          return k_out[:, :, :cache_position[-1].item()+1], v_out[:, :, :cache_position[-1].item()+1]
       ```   
+=======
+>>>>>>> Stashed changes
 
+   I am to represent the input, output pair as both "text" and image. text representation would be flattened inputs/outputs with line separator (at end of each row) and token embedding and special token like line separator will be trained from scratch. image representation would be RGB of the 2d grid, where 0 ~ 9 each mapped to a unique color. then I will represent the input as a sequence, input_text1, input_image1, output_text1, output_image1, ... and target would be shifted input_text1, output_text1,... where images are ignored.
+5. StaticCache Modifications
+   - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/transformers/cache_utils.py (line 1276). Together with cache_position will ensure
+      DFS properly backtrack since Cache is not a copy.
+      ```python        
+         return k_out[:, :, :cache_position[-1].item()+1], v_out[:, :, :cache_position[-1].item()+1]
+         ```
+6. 4d position based attention mask. _update_causal_mask will ingore 4d attention mask passed in.
+   - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py (line 546)
+      ```python
+         # causal_mask = self._update_causal_mask(
+         #     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+         # )
+         causal_mask = attention_mask
+      ```
+7. 
 
