@@ -129,6 +129,53 @@ class PositionalEmbedding2D(nn.Module):
         # Need __call__ to delegate to forward for hook registration if using nn.Module
     def __call__(self, module, input, output):
         return self.forward(module, input, output)
+    
+class Pos2DAttnScore(nn.Module):
+    def __init__(self, layers, heads, max_height_delta, max_width_delta, centered):
+        super().__init__()
+        self.layers = layers
+        self.heads = heads
+        self.max_height_delta = max_height_delta
+        self.max_width_delta = max_width_delta
+        self.centered = centered
+        # Parameter: (layers, heads, max_height_delta, max_width_delta)
+        self.relative_position_bias = nn.Parameter(
+            torch.empty(self.layers,
+                        self.heads,
+                        self.max_height_delta,
+                        self.max_width_delta)
+        )
+        # Initialize parameters (e.g., small random values or zeros)
+        nn.init.normal_(self.relative_position_bias, std=0.01)
+
+    def forward(self, rows: torch.LongTensor, cols: torch.LongTensor):
+        '''
+        rows: (L,)
+        cols: (L,)
+        '''
+        L = rows.size(0)
+
+        # Compute distance matrices (L, L)
+        height_indices = (rows.unsqueeze(0) - rows.unsqueeze(1))  # (L, L)
+        width_indices = (cols.unsqueeze(0) - cols.unsqueeze(1))   # (L, L)
+
+        # to map a delta of 0 to the middle of the parameter's dimension.
+        if self.centered:
+            height_center = (self.max_height_delta - 1) // 2
+            width_center = (self.max_width_delta - 1) // 2
+            height_indices += height_center
+            width_indices += width_center
+            height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
+            width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
+
+        # Indices are (L, L), broadcast to (layers, heads, L, L)
+        scores = self.relative_position_bias[:, :, height_indices, width_indices] # (layers, heads, L, L)
+
+        # Causal mask: i > j -> -inf
+        causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
+        scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(torch.bfloat16).min)
+
+        return scores
 
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
