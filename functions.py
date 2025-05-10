@@ -193,7 +193,25 @@ class AcrossGrid2DAttnScore(WithinGrid2DAttnScore):
         return scores
 
 class MultiGridAttention(nn.Module):
-    def __init__(self, layers, heads, max_height_delta1, max_width_delta1, max_height_delta2, max_width_delta2):
+    """
+    A module that computes attention scores for multiple grids in a sequence.
+    
+    This module handles both within-grid attention (tokens attending to other tokens in the same grid)
+    and across-grid attention (tokens in output grid attending to tokens in input grid).
+    It's designed to work with 2D grid structures where each token has a row and column position.
+    
+    The module creates a full attention bias matrix that can be added to the standard attention scores
+    in transformer models, enabling spatial awareness in the attention mechanism.
+    
+    Args:
+        layers (int): Number of transformer layers.
+        heads (int): Number of attention heads per layer.
+        max_height_delta1 (int): Maximum height difference for within-grid attention.
+        max_width_delta1 (int): Maximum width difference for within-grid attention.
+        max_height_delta2 (int): Maximum height difference for across-grid attention.
+        max_width_delta2 (int): Maximum width difference for across-grid attention.
+    """
+    def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int):
         super().__init__()
         
         # Within-grid attention (same for all grids)
@@ -863,7 +881,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False):
+def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True):
     """Generate data for training or testing.
     
     Args:
@@ -894,7 +912,7 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
             task = forwardTask(task, generateTransformPara(len(task)))
         
         # Tokenize the task
-        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition)
+        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition, ReturnLengths=ReturnLengths)
         yield out
 
 def create_attention_mask(length: int) -> torch.Tensor:
