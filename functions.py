@@ -436,7 +436,7 @@ def backwardTask(task, tpara):
 
 '''  ----------------------------------- Tokenization utilities ------------------------------------- '''
 def numpy2torch(x):
-    """Convert numpy array to torch tensor and move to GPU, with length truncation."""
+    """Convert numpy array to torch tensor and move to GPU"""
     x = torch.tensor(x)[None].to('cuda')
     return x
 
@@ -452,7 +452,7 @@ def find_first_exceed(task, max_len, extra_tokens=4):
             return i
     return len(task)  # If total never exceeds max_len
 
-def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False):
+def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False):
     """
     Tokenizes a task for causal (autoregressive) training or inference,
     optionally providing 2D positional indices using optimized list extensions.
@@ -465,16 +465,19 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
         max_length: Maximum sequence length for truncation.
         IsDecode: Whether the function is being used for inference (True) or training (False).
         NeedPosition: If True, return row and column indices for 2D position embedding.
+        ReturnLengths: If True, return a list of lengths for each input and output grid.
 
     Returns:
-        If NeedPosition is False:
+        If NeedPosition is False and ReturnLengths is False:
             input_tokens: Numpy array of input token IDs.
             final_target: Numpy array of shifted target token IDs (training) or raw grid (decoding).
-        If NeedPosition is True:
-            input_tokens: Numpy array of input token IDs.
-            final_target: Same as above.
-            row_indices: Numpy array of row indices.
-            col_indices: Numpy array of column indices.
+        If NeedPosition is True or ReturnLengths is True:
+            Dictionary containing requested outputs:
+            - "input_tokens": Numpy array of input token IDs.
+            - "target_tokens": Same as above.
+            - "row_indices": Numpy array of row indices (if NeedPosition is True).
+            - "col_indices": Numpy array of column indices (if NeedPosition is True).
+            - "lengths": List of lengths for each input and output grid (if ReturnLengths is True).
     """
     # Special token IDs
     BOS_X = 10  # Beginning of input grid
@@ -489,6 +492,9 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
     if NeedPosition:
         row_indices = []
         col_indices = []
+    if ReturnLengths:
+        lengths = []
+    
     flag = not IsDecode and not autoregressive
     n_task = find_first_exceed(task, max_length)
     if IsDecode:
@@ -499,8 +505,12 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
     n = len(task)
     for i, (x, y) in enumerate(task):
         IsLast = (i == n-1) and IsDecode
-        # Process input grid (x)
         
+        # Track starting position for length calculation
+        if ReturnLengths:
+            input_start_pos = len(input_tokens)
+        
+        # Process input grid (x)
         input_tokens.append(BOS_X)
         if flag:
             target_tokens.append(PAD_TOKEN)
@@ -531,8 +541,15 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
         if NeedPosition:
             row_indices.append(0)
             col_indices.append(0)
-        # Process output grid (y)
         
+        # Record input length if requested
+        if ReturnLengths:
+            output_start_pos = len(input_tokens)
+            input_length = output_start_pos - input_start_pos
+            lengths.append(input_length)
+            
+
+        # Process output grid (y)
         input_tokens.append(BOS_Y)
         if flag:
             target_tokens.append(PAD_TOKEN)  # Mask BOS_Y
@@ -565,8 +582,13 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
                 col_indices.append(0)
             if flag:
                 target_tokens.append(EOS_Y)  # Include EOS_Y in target
+            
+            # Record output length if requested
+            if ReturnLengths:
+                output_length = len(input_tokens) - output_start_pos
+                lengths.append(output_length)
         else:
-            target_tokens = y
+            target_tokens = y  # For the last example in decode mode, we don't add output length
         
     # Create shifted targets (for next-token prediction)
     if not IsDecode:
@@ -583,8 +605,10 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
     else:
         out["target_tokens"] = numpy2torch(target_tokens)
     if NeedPosition:
-        out["row_indices"] = numpy2torch(row_indices)
-        out["col_indices"] = numpy2torch(col_indices)
+        out["row_indices"] = numpy2torch(row_indices)[0]
+        out["col_indices"] = numpy2torch(col_indices)[0]
+    if ReturnLengths:
+        out["lengths"] = lengths
     return out
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
