@@ -130,14 +130,13 @@ class PositionalEmbedding2D(nn.Module):
     def __call__(self, module, input, output):
         return self.forward(module, input, output)
     
-class Pos2DAttnScore(nn.Module):
-    def __init__(self, layers, heads, max_height_delta, max_width_delta, centered):
+class WithinGrid2DAttnScore(nn.Module):
+    def __init__(self, layers, heads, max_height_delta, max_width_delta):
         super().__init__()
         self.layers = layers
         self.heads = heads
         self.max_height_delta = max_height_delta
         self.max_width_delta = max_width_delta
-        self.centered = centered
         # Parameter: (layers, heads, max_height_delta, max_width_delta)
         self.relative_position_bias = nn.Parameter(
             torch.empty(self.layers,
@@ -149,34 +148,167 @@ class Pos2DAttnScore(nn.Module):
         nn.init.normal_(self.relative_position_bias, std=0.01)
 
     def forward(self, rows: torch.LongTensor, cols: torch.LongTensor):
-        '''
-        rows: (L,)
-        cols: (L,)
-        '''
-        L = rows.size(0)
-
         # Compute distance matrices (L, L)
         height_indices = (rows.unsqueeze(0) - rows.unsqueeze(1))  # (L, L)
         width_indices = (cols.unsqueeze(0) - cols.unsqueeze(1))   # (L, L)
-
-        # to map a delta of 0 to the middle of the parameter's dimension.
-        if self.centered:
-            height_center = (self.max_height_delta - 1) // 2
-            width_center = (self.max_width_delta - 1) // 2
-            height_indices += height_center
-            width_indices += width_center
-            height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
-            width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
 
         # Indices are (L, L), broadcast to (layers, heads, L, L)
         scores = self.relative_position_bias[:, :, height_indices, width_indices] # (layers, heads, L, L)
 
         # Causal mask: i > j -> -inf
-        causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
-        scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(torch.bfloat16).min)
+        # causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
+        # scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(torch.bfloat16).min)
+
+        return scores
+    
+class AcrossGrid2DAttnScore(WithinGrid2DAttnScore):
+    def __init__(self, layers, heads, max_height_delta, max_width_delta):
+        super().__init__(layers, heads, max_height_delta, max_width_delta)
+
+    def forward(self, rows1: torch.LongTensor, cols1: torch.LongTensor, rows2: torch.LongTensor, cols2: torch.LongTensor):
+        '''
+        rows1, cols1 are the coordinates of the input grid of shape (L,)
+        rows2, cols2 are the coordinates of the output grid of shape (l,)
+        returns a tensor of shape (layers, heads, l, L), relative bias is left corner aligned, i.e. input (0,0) is aligned with output (0,0)
+        '''
+        # Compute distance matrices (l, L)
+        height_indices = (rows2.unsqueeze(1) - rows1.unsqueeze(0))  # (l, L)
+        width_indices = (cols2.unsqueeze(1) - cols1.unsqueeze(0))   # (l, L)
+
+        # to map a delta of 0 to the middle of the parameter's dimension.
+        height_center = (self.max_height_delta - 1) // 2
+        width_center = (self.max_width_delta - 1) // 2
+        height_indices += height_center
+        width_indices += width_center
+        height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
+        width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
+
+        # Indices are (l, L), broadcast to (layers, heads, l, L)
+        scores = self.relative_position_bias[:, :, height_indices, width_indices] # (layers, heads, l, L)
+
+        # Causal mask: i > j -> -inf
+        # causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
+        # scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(torch.bfloat16).min)
 
         return scores
 
+class MultiGridAttention(nn.Module):
+    def __init__(self, layers, heads, max_height_delta1, max_width_delta1, max_height_delta2, max_width_delta2):
+        super().__init__()
+        
+        # Within-grid attention (same for all grids)
+        self.within_grid_attn = WithinGrid2DAttnScore(
+            layers, heads, max_height_delta1, max_width_delta1
+        )
+        
+        # Across-grid attention (for y_i attending to x_i)
+        self.across_grid_attn = AcrossGrid2DAttnScore(
+            layers, heads, max_height_delta2, max_width_delta2
+        )
+    
+    def forward(self, rows, cols, lengths):
+        """
+        Constructs a full attention score matrix combining within-grid and across-grid attention.
+        
+        Args:
+            rows: Tensor of row indices for all tokens, shape (L,)
+            cols: Tensor of column indices for all tokens, shape (L,)
+            lengths: List of lengths for each grid [len(x_1), len(y_1), len(x_2), len(y_2), ...]
+            
+        Returns:
+            attention_biases: Tensor of shape (layers, heads, L, L) containing all attention biases
+        """
+        device = rows.device
+        total_length = rows.size(0)
+        layers = self.within_grid_attn.layers
+        heads = self.within_grid_attn.heads
+        
+        # Initialize attention bias matrix with zeros
+        attention_biases = torch.zeros(
+            (layers, heads, total_length, total_length), 
+            device=device
+        )
+        
+        # Keep track of current position in the sequence
+        current_pos = 0
+        
+        # Process each input-output pair
+        # Calculate number of complete pairs and check if there's an unpaired input (decoding)
+        num_complete_pairs = len(lengths) // 2
+        has_unpaired_input = len(lengths) % 2 == 1
+        
+        # Process each input-output pair
+        for pair_idx in range(num_complete_pairs):
+            # Get indices for current input (x_i) and output (y_i)
+            x_start = current_pos
+            x_end = x_start + lengths[pair_idx * 2]
+            y_start = x_end
+            y_end = y_start + lengths[pair_idx * 2 + 1]
+            
+            # Extract coordinates for current input and output
+            x_rows = rows[x_start:x_end]
+            x_cols = cols[x_start:x_end]
+            y_rows = rows[y_start:y_end]
+            y_cols = cols[y_start:y_end]
+            
+            # 1. Within-grid attention for input (x_i to x_i)
+            x_to_x_bias = self.within_grid_attn(x_rows, x_cols)
+            attention_biases[:, :, x_start:x_end, x_start:x_end] = x_to_x_bias
+            
+            # 2. Within-grid attention for output (y_i to y_i)
+            y_to_y_bias = self.within_grid_attn(y_rows, y_cols)
+            attention_biases[:, :, y_start:y_end, y_start:y_end] = y_to_y_bias
+            
+            # 3. Across-grid attention for output attending to input (y_i to x_i)
+            y_to_x_bias = self.across_grid_attn(x_rows, x_cols, y_rows, y_cols)
+            attention_biases[:, :, y_start:y_end, x_start:x_end] = y_to_x_bias
+            
+            # Update current position
+            current_pos = y_end
+        
+        # Handle the unpaired input if it exists
+        if has_unpaired_input:
+            # Get indices for the unpaired input
+            x_start = current_pos
+            x_end = x_start + lengths[-1]
+            
+            # Extract coordinates for unpaired input
+            x_rows = rows[x_start:x_end]
+            x_cols = cols[x_start:x_end]
+            
+            # Only apply within-grid attention for the unpaired input
+            x_to_x_bias = self.within_grid_attn(x_rows, x_cols)
+            attention_biases[:, :, x_start:x_end, x_start:x_end] = x_to_x_bias
+            
+            # Update current position
+            current_pos = x_end
+        
+        # 1. Special token handling: zero out rows/cols where row value is 0 (special tokens)
+        special_token_mask = (rows == 0)
+        # Create mask for special tokens in attention matrix (both rows and columns)
+        special_row_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
+            layers, heads, total_length, total_length
+        )
+        special_col_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
+            layers, heads, total_length, total_length
+        )
+            
+        # Zero out attention scores for special tokens
+        attention_biases.masked_fill_(special_row_mask, 0.0)
+        attention_biases.masked_fill_(special_col_mask, 0.0)
+        
+        # 2. Apply causal mask to ensure past tokens don't attend to future tokens
+        causal_mask = torch.triu(
+            torch.ones(total_length, total_length, device=device), 
+            diagonal=1
+        ).bool()
+        attention_biases.masked_fill_(
+            causal_mask.unsqueeze(0).unsqueeze(0), 
+            torch.finfo(torch.bfloat16).min  # Use -inf for bfloat16
+        )
+        
+        return attention_biases
+        
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
                                          max_seq_length = max_seq_length,
