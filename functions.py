@@ -387,59 +387,35 @@ class _MultiGridAttn(torch.autograd.Function):
                 rows,           # (L,)  LongTensor, 0-based coords
                 cols,           # (L,)  LongTensor, 0-based coords
                 lengths,        # small Python list of ints
-                layer_idx       # int
+                layer_idx,      # int
+                cached_indices  # dict of precomputed indices
                ):
         # unpack
         layers, H, mh1, mw1 = within_bias.shape
         _,      _, mh2, mw2 = across_bias.shape
         L = rows.shape[0]
 
-        # precompute centers for across
-        hc2 = (mh2 - 1) // 2
-        wc2 = (mw2 - 1) // 2
-
         # build the full bias
         attn = torch.zeros((1, H, L, L),
                            device=rows.device,
                            dtype=torch.bfloat16)
 
-        cur = 0
         Npairs = len(lengths)//2
         has_tail = (len(lengths) % 2 == 1)
 
         for i in range(Npairs):
-            lx, ly = lengths[2*i], lengths[2*i+1]
-            xs, xe = cur,    cur + lx
-            ys, ye = xe,     xe  + ly
-
-            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
-            y_rows, y_cols = rows[ys:ye], cols[ys:ye]
-
-            # 1) within x→x
-            hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
-            wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
+            # Use cached indices
+            hdx, wdx, xs, xe = cached_indices[f'x2x_{i}']
             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
-
-            # 2) within y→y
-            hdy = torch.clamp(y_rows.unsqueeze(0) - y_rows.unsqueeze(1), 0, mh1-1)
-            wdy = torch.clamp(y_cols.unsqueeze(0) - y_cols.unsqueeze(1), 0, mw1-1)
+            
+            hdy, wdy, ys, ye = cached_indices[f'y2y_{i}']
             attn[:, :, ys:ye, ys:ye] = within_bias[layer_idx:layer_idx+1, :, hdy, wdy]
-
-            # 3) across y→x (note the center offsets)
-            hdxy = (y_rows.unsqueeze(1) - x_rows.unsqueeze(0)) + hc2
-            wdxy = (y_cols.unsqueeze(1) - x_cols.unsqueeze(0)) + wc2
-            hdxy = torch.clamp(hdxy, 0, mh2-1)
-            wdxy = torch.clamp(wdxy, 0, mw2-1)
+            
+            hdxy, wdxy, ys, ye, xs, xe = cached_indices[f'y2x_{i}']
             attn[:, :, ys:ye, xs:xe] = across_bias[layer_idx:layer_idx+1, :, hdxy, wdxy]
 
-            cur = ye
-
         if has_tail:
-            lx = lengths[-1]
-            xs, xe = cur, cur + lx
-            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
-            hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
-            wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
+            hdx, wdx, xs, xe = cached_indices['tail']
             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
 
         # --- special‐token zeroing ---
@@ -456,18 +432,20 @@ class _MultiGridAttn(torch.autograd.Function):
 
         # save only tiny things
         ctx.save_for_backward(rows, cols)
-        ctx.lengths   = lengths
+        ctx.lengths = lengths
         ctx.layer_idx = layer_idx
-        ctx.shapes    = (layers, H, mh1, mw1, mh2, mw2)
+        ctx.shapes = (layers, H, mh1, mw1, mh2, mw2)
+        ctx.cached_indices = cached_indices
 
         return attn
 
     @staticmethod
     def backward(ctx, grad_attn):
         rows, cols = ctx.saved_tensors
-        lengths   = ctx.lengths
+        lengths = ctx.lengths
         layer_idx = ctx.layer_idx
         layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
+        cached_indices = ctx.cached_indices
         L = rows.shape[0]
 
         # re‐zero out masked positions so no grad leaks
@@ -485,69 +463,44 @@ class _MultiGridAttn(torch.autograd.Function):
                                device=grad_attn.device,
                                dtype=grad_attn.dtype)
 
-        # recompute center offsets
-        hc2 = (mh2 - 1)//2
-        wc2 = (mw2 - 1)//2
-
-        cur = 0
         Npairs = len(lengths)//2
         has_tail = (len(lengths)%2==1)
         rows -= 1 # rows / cols are 1-index. should be 0 index for hdx*mw1 + wdx
         cols -= 1
+        
         for i in range(Npairs):
-            lx, ly = lengths[2*i], lengths[2*i+1]
-            xs, xe = cur,    cur + lx
-            ys, ye = xe,     xe  + ly
-
-            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
-            y_rows, y_cols = rows[ys:ye], cols[ys:ye]
-
-            # within x→x grad
-            g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)  # (H, lx*lx)
-            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
-            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
-            idx = hdx * mw1 + wdx
+            # Use cached indices for gradients
+            hdx, wdx, xs, xe = cached_indices[f'x2x_{i}']
+            g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
+            idx = hdx.reshape(-1) * mw1 + wdx.reshape(-1)
             d_within[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
                                                          g_xx)
-
-            # within y→y grad
+            
+            hdy, wdy, ys, ye = cached_indices[f'y2y_{i}']
             g_yy = grad_attn[0, :, ys:ye, ys:ye].reshape(H, -1)
-            hdy = torch.clamp(y_rows.unsqueeze(0)-y_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
-            wdy = torch.clamp(y_cols.unsqueeze(0)-y_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
-            idx = hdy * mw1 + wdy
+            idx = hdy.reshape(-1) * mw1 + wdy.reshape(-1)
             d_within[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
                                                          g_yy)
-
-            # across y→x grad (with center)
-            g_yx = grad_attn[0, :, ys:ye, xs:xe].reshape(H, -1)   # (H, ly*lx)
-            hdxy = (y_rows.unsqueeze(1) - x_rows.unsqueeze(0) + hc2).reshape(-1)
-            wdxy = (y_cols.unsqueeze(1) - x_cols.unsqueeze(0) + wc2).reshape(-1)
-            hdxy = torch.clamp(hdxy, 0, mh2-1)
-            wdxy = torch.clamp(wdxy, 0, mw2-1)
-            idx  = hdxy * mw2 + wdxy
+            
+            hdxy, wdxy, ys, ye, xs, xe = cached_indices[f'y2x_{i}']
+            g_yx = grad_attn[0, :, ys:ye, xs:xe].reshape(H, -1)
+            idx = hdxy.reshape(-1) * mw2 + wdxy.reshape(-1)
             d_across[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
                                                          g_yx)
 
-            cur = ye
-
         if has_tail:
-            lx = lengths[-1]
-            xs, xe = cur, cur + lx
-            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
-
+            hdx, wdx, xs, xe = cached_indices['tail']
             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
-            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
-            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
-            idx = hdx * mw1 + wdx
+            idx = hdx.reshape(-1) * mw1 + wdx.reshape(-1)
             d_within[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
                                                          g_xx)
 
         # only two grads; rest (rows, cols, lengths, layer_idx) get None
-        return d_within, d_across, None, None, None, None
+        return d_within, d_across, None, None, None, None, None
 
 class MultiGridAttention2(nn.Module):
     def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int):
@@ -577,21 +530,80 @@ class MultiGridAttention2(nn.Module):
         self.rows = None
         self.cols = None
         self.lengths = None
+        
+        # Cache for computed indices
+        self.cached_indices = None
     
     def set_indices(self, rows, cols, lengths):
         """Set the row, column indices and lengths for attention computation."""
         self.rows = rows
         self.cols = cols
         self.lengths = lengths
+        
+        # Compute and cache indices
+        del self.cached_indices
+        self._compute_indices()
+    
+    def _compute_indices(self):
+        """Precompute all indices needed for attention computation."""
+        mh1, mw1 = self.within_grid_attn_bias.shape[2:]
+        mh2, mw2 = self.across_grid_attn_bias.shape[2:]
+        
+        # Precompute centers for across
+        hc2 = (mh2 - 1) // 2
+        wc2 = (mw2 - 1) // 2
+        
+        indices = {}
+        cur = 0
+        Npairs = len(self.lengths)//2
+        has_tail = (len(self.lengths) % 2 == 1)
+        
+        for i in range(Npairs):
+            lx, ly = self.lengths[2*i], self.lengths[2*i+1]
+            xs, xe = cur, cur + lx
+            ys, ye = xe, xe + ly
+            
+            x_rows, x_cols = self.rows[xs:xe], self.cols[xs:xe]
+            y_rows, y_cols = self.rows[ys:ye], self.cols[ys:ye]
+            
+            # Within x→x indices
+            hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
+            indices[f'x2x_{i}'] = (hdx, wdx, xs, xe)
+            
+            # Within y→y indices
+            hdy = torch.clamp(y_rows.unsqueeze(0) - y_rows.unsqueeze(1), 0, mh1-1)
+            wdy = torch.clamp(y_cols.unsqueeze(0) - y_cols.unsqueeze(1), 0, mw1-1)
+            indices[f'y2y_{i}'] = (hdy, wdy, ys, ye)
+            
+            # Across y→x indices
+            hdxy = (y_rows.unsqueeze(1) - x_rows.unsqueeze(0)) + hc2
+            wdxy = (y_cols.unsqueeze(1) - x_cols.unsqueeze(0)) + wc2
+            hdxy = torch.clamp(hdxy, 0, mh2-1)
+            wdxy = torch.clamp(wdxy, 0, mw2-1)
+            indices[f'y2x_{i}'] = (hdxy, wdxy, ys, ye, xs, xe)
+            
+            cur = ye
+            
+        if has_tail:
+            lx = self.lengths[-1]
+            xs, xe = cur, cur + lx
+            x_rows, x_cols = self.rows[xs:xe], self.cols[xs:xe]
+            hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
+            indices['tail'] = (hdx, wdx, xs, xe)
+            
+        self.cached_indices = indices
 
     def forward(self, layer_idx):
         # rows, cols, lengths are already stored as tensors / python list
         return _MultiGridAttn.apply(
             self.within_grid_attn_bias,
             self.across_grid_attn_bias,
-            self.rows, self.cols, self.lengths, layer_idx
+            self.rows, self.cols, self.lengths, layer_idx,
+            self.cached_indices
         )
-      
+
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
                                          max_seq_length = max_seq_length,
