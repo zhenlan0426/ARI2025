@@ -384,81 +384,79 @@ class _MultiGridAttn(torch.autograd.Function):
     def forward(ctx,
                 within_bias,    # (layers, H, mh1, mw1)
                 across_bias,    # (layers, H, mh2, mw2)
-                rows,           # (L,)
-                cols,           # (L,)
-                lengths,        # list of ints
+                rows,           # (L,)  LongTensor, 0-based coords
+                cols,           # (L,)  LongTensor, 0-based coords
+                lengths,        # small Python list of ints
                 layer_idx       # int
                ):
-        # unpack some shapes
+        # unpack
         layers, H, mh1, mw1 = within_bias.shape
-        _,   _, mh2, mw2 = across_bias.shape
+        _,      _, mh2, mw2 = across_bias.shape
         L = rows.shape[0]
 
-        # build the full bias matrix exactly as your original forward:
+        # precompute centers for across
+        hc2 = (mh2 - 1) // 2
+        wc2 = (mw2 - 1) // 2
+
+        # build the full bias
         attn = torch.zeros((1, H, L, L),
                            device=rows.device,
                            dtype=torch.bfloat16)
 
         cur = 0
-        lens = lengths
-        Npairs = len(lens)//2
-        has_tail = (len(lens)%2==1)
+        Npairs = len(lengths)//2
+        has_tail = (len(lengths) % 2 == 1)
 
         for i in range(Npairs):
-            lx, ly = lens[2*i], lens[2*i+1]
-            xs, xe = cur, cur+lx
-            ys, ye = xe,  xe+ly
+            lx, ly = lengths[2*i], lengths[2*i+1]
+            xs, xe = cur,    cur + lx
+            ys, ye = xe,     xe  + ly
 
-            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
-            y_rows = rows[ys:ye]; y_cols = cols[ys:ye]
+            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
+            y_rows, y_cols = rows[ys:ye], cols[ys:ye]
 
-            # within x→x
-            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1)
-            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1)
+            # 1) within x→x
+            hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
 
-            # within y→y
-            hdy = torch.clamp(y_rows.unsqueeze(0)-y_rows.unsqueeze(1), 0, mh1-1)
-            wdy = torch.clamp(y_cols.unsqueeze(0)-y_cols.unsqueeze(1), 0, mw1-1)
+            # 2) within y→y
+            hdy = torch.clamp(y_rows.unsqueeze(0) - y_rows.unsqueeze(1), 0, mh1-1)
+            wdy = torch.clamp(y_cols.unsqueeze(0) - y_cols.unsqueeze(1), 0, mw1-1)
             attn[:, :, ys:ye, ys:ye] = within_bias[layer_idx:layer_idx+1, :, hdy, wdy]
 
-            # across y→x
-            hdxy = torch.clamp(y_rows.unsqueeze(1)-x_rows.unsqueeze(0), 0, mh2-1)
-            wdxy = torch.clamp(y_cols.unsqueeze(1)-x_cols.unsqueeze(0), 0, mw2-1)
+            # 3) across y→x (note the center offsets)
+            hdxy = (y_rows.unsqueeze(1) - x_rows.unsqueeze(0)) + hc2
+            wdxy = (y_cols.unsqueeze(1) - x_cols.unsqueeze(0)) + wc2
+            hdxy = torch.clamp(hdxy, 0, mh2-1)
+            wdxy = torch.clamp(wdxy, 0, mw2-1)
             attn[:, :, ys:ye, xs:xe] = across_bias[layer_idx:layer_idx+1, :, hdxy, wdxy]
 
             cur = ye
 
         if has_tail:
-            lx = lens[-1]
-            xs, xe = cur, cur+lx
-            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
-            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1)
-            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1)
+            lx = lengths[-1]
+            xs, xe = cur, cur + lx
+            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
+            hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
 
-        # 1. Special token handling: zero out rows/cols where row value is 0 (special tokens)
-        special_token_mask = (rows == 0)
-        # Create mask for special tokens in attention matrix (both rows and columns)
-        special_row_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(1, H, L, L)
-        special_col_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, H, L, L)
-        # Zero out attention scores for special tokens
-        attn.masked_fill_(special_row_mask, 0.0)
-        attn.masked_fill_(special_col_mask, 0.0)
-        
-        # 2. Apply causal mask to ensure past tokens don't attend to future tokens
-        causal_mask = torch.triu(
-            torch.ones(L, L, device=rows.device), 
-            diagonal=1
-        ).bool()
-        attn.masked_fill_(
-            causal_mask.unsqueeze(0).unsqueeze(0), 
-            torch.finfo(torch.bfloat16).min  # Use -inf for bfloat16
-        )
+        # --- special‐token zeroing ---
+        special = (rows == 0)  # (L,)
+        # zero any row or column where row==0
+        sr = special.view(1,1,L,1).expand(1,H,L,L)
+        sc = special.view(1,1,1,L).expand(1,H,L,L)
+        attn.masked_fill_(sr, 0.0)
+        attn.masked_fill_(sc, 0.0)
 
-        # SAVE for backward pass
+        # --- causal mask ---
+        causal = torch.triu(torch.ones(L,L,device=rows.device), diagonal=1).bool()
+        attn.masked_fill_(causal.view(1,1,L,L), torch.finfo(attn.dtype).min)
+
+        # save only tiny things
         ctx.save_for_backward(rows, cols)
-        ctx.lengths   = lens
+        ctx.lengths   = lengths
         ctx.layer_idx = layer_idx
         ctx.shapes    = (layers, H, mh1, mw1, mh2, mw2)
 
@@ -466,28 +464,20 @@ class _MultiGridAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_attn):
-        # unpack
         rows, cols = ctx.saved_tensors
-        lens       = ctx.lengths
-        layer_idx  = ctx.layer_idx
+        lengths   = ctx.lengths
+        layer_idx = ctx.layer_idx
         layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
         L = rows.shape[0]
-        # ----- zero out the masked positions -----
-        # 1) special tokens (rows==0) cannot produce grad
-        special = (rows == 0)                                       # (L,)
-        special_mask = special.unsqueeze(0) | special.unsqueeze(1)  # (L,L)
 
-        # 2) causal mask (i<j) was set to -inf
-        causal_mask = torch.triu(torch.ones(L, L,
-                               device=rows.device), diagonal=1).bool()
+        # re‐zero out masked positions so no grad leaks
+        special = (rows == 0)           # (L,)
+        sp_mask = special.unsqueeze(0) | special.unsqueeze(1)  # (L,L)
+        causal  = torch.triu(torch.ones(L,L,device=rows.device), diagonal=1).bool()
+        full_mask = (sp_mask | causal).view(1,1,L,L)
+        grad_attn = grad_attn.masked_fill(full_mask, 0.0)
 
-        # combine
-        full_mask = (special_mask | causal_mask)    # (L,L)
-        # expand into the (1,H,L,L) grad
-        fm = full_mask.unsqueeze(0).unsqueeze(0)    # (1,1,L,L)
-        grad_attn.masked_fill_(fm, 0.0)  # zero out those gradients
-
-        # zero‐buffers for each parameter
+        # prepare zero‐buffers for param‐grads
         d_within = torch.zeros(layers, H, mh1, mw1,
                                device=grad_attn.device,
                                dtype=grad_attn.dtype)
@@ -495,61 +485,68 @@ class _MultiGridAttn(torch.autograd.Function):
                                device=grad_attn.device,
                                dtype=grad_attn.dtype)
 
+        # recompute center offsets
+        hc2 = (mh2 - 1)//2
+        wc2 = (mw2 - 1)//2
+
         cur = 0
-        Npairs = len(lens)//2
-        has_tail = (len(lens)%2==1)
+        Npairs = len(lengths)//2
+        has_tail = (len(lengths)%2==1)
         rows -= 1 # rows / cols are 1-index. should be 0 index for hdx*mw1 + wdx
         cols -= 1
         for i in range(Npairs):
-            lx, ly = lens[2*i], lens[2*i+1]
-            xs, xe = cur, cur+lx
-            ys, ye = xe, xe+ly
+            lx, ly = lengths[2*i], lengths[2*i+1]
+            xs, xe = cur,    cur + lx
+            ys, ye = xe,     xe  + ly
 
-            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
-            y_rows = rows[ys:ye]; y_cols = cols[ys:ye]
+            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
+            y_rows, y_cols = rows[ys:ye], cols[ys:ye]
 
-            # grad for within x→x
+            # within x→x grad
             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)  # (H, lx*lx)
             hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
             wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
-            idx = hdx*mw1 + wdx
+            idx = hdx * mw1 + wdx
             d_within[layer_idx].view(H, -1).scatter_add_(1,
-                                                        idx.unsqueeze(0).expand(H, -1),
-                                                        g_xx)
+                                                         idx.unsqueeze(0).expand(H, -1),
+                                                         g_xx)
 
-            # within y→y
+            # within y→y grad
             g_yy = grad_attn[0, :, ys:ye, ys:ye].reshape(H, -1)
             hdy = torch.clamp(y_rows.unsqueeze(0)-y_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
             wdy = torch.clamp(y_cols.unsqueeze(0)-y_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
-            idx = hdy*mw1 + wdy
+            idx = hdy * mw1 + wdy
             d_within[layer_idx].view(H, -1).scatter_add_(1,
-                                                        idx.unsqueeze(0).expand(H, -1),
-                                                        g_yy)
+                                                         idx.unsqueeze(0).expand(H, -1),
+                                                         g_yy)
 
-            # across y→x
-            g_yx = grad_attn[0, :, ys:ye, xs:xe].reshape(H, -1)    # (H, ly*lx)
-            hdxy = torch.clamp(y_rows.unsqueeze(1)-x_rows.unsqueeze(0), 0, mh2-1).reshape(-1)
-            wdxy = torch.clamp(y_cols.unsqueeze(1)-x_cols.unsqueeze(0), 0, mw2-1).reshape(-1)
-            idx = hdxy*mw2 + wdxy
+            # across y→x grad (with center)
+            g_yx = grad_attn[0, :, ys:ye, xs:xe].reshape(H, -1)   # (H, ly*lx)
+            hdxy = (y_rows.unsqueeze(1) - x_rows.unsqueeze(0) + hc2).reshape(-1)
+            wdxy = (y_cols.unsqueeze(1) - x_cols.unsqueeze(0) + wc2).reshape(-1)
+            hdxy = torch.clamp(hdxy, 0, mh2-1)
+            wdxy = torch.clamp(wdxy, 0, mw2-1)
+            idx  = hdxy * mw2 + wdxy
             d_across[layer_idx].view(H, -1).scatter_add_(1,
-                                                        idx.unsqueeze(0).expand(H, -1),
-                                                        g_yx)
+                                                         idx.unsqueeze(0).expand(H, -1),
+                                                         g_yx)
 
             cur = ye
 
         if has_tail:
-            lx = lens[-1]
-            xs, xe = cur, cur+lx
-            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
+            lx = lengths[-1]
+            xs, xe = cur, cur + lx
+            x_rows, x_cols = rows[xs:xe], cols[xs:xe]
+
             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
             hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
             wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
-            idx = hdx*mw1 + wdx
+            idx = hdx * mw1 + wdx
             d_within[layer_idx].view(H, -1).scatter_add_(1,
-                                                        idx.unsqueeze(0).expand(H, -1),
-                                                        g_xx)
+                                                         idx.unsqueeze(0).expand(H, -1),
+                                                         g_xx)
 
-        # no grads w.r.t rows, cols, lengths, layer_idx
+        # only two grads; rest (rows, cols, lengths, layer_idx) get None
         return d_within, d_across, None, None, None, None
 
 class MultiGridAttention2(nn.Module):
