@@ -388,7 +388,9 @@ class _MultiGridAttn(torch.autograd.Function):
                 cols,           # (L,)  LongTensor, 0-based coords
                 lengths,        # small Python list of ints
                 layer_idx,      # int
-                cached_indices  # dict of precomputed indices
+                cached_indices, # dict of precomputed indices
+                sp_mask,        # (L,L)
+                causal         # (L,L)
                ):
         # unpack
         layers, H, mh1, mw1 = within_bias.shape
@@ -419,15 +421,9 @@ class _MultiGridAttn(torch.autograd.Function):
             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
 
         # --- special‐token zeroing ---
-        special = (rows == 0)  # (L,)
-        # zero any row or column where row==0
-        sr = special.view(1,1,L,1).expand(1,H,L,L)
-        sc = special.view(1,1,1,L).expand(1,H,L,L)
-        attn.masked_fill_(sr, 0.0)
-        attn.masked_fill_(sc, 0.0)
+        attn.masked_fill_(sp_mask.view(1,1,L,L), 0.0)
 
         # --- causal mask ---
-        causal = torch.triu(torch.ones(L,L,device=rows.device), diagonal=1).bool()
         attn.masked_fill_(causal.view(1,1,L,L), torch.finfo(attn.dtype).min)
 
         # save only tiny things
@@ -436,6 +432,8 @@ class _MultiGridAttn(torch.autograd.Function):
         ctx.layer_idx = layer_idx
         ctx.shapes = (layers, H, mh1, mw1, mh2, mw2)
         ctx.cached_indices = cached_indices
+        ctx.sp_mask = sp_mask
+        ctx.causal = causal
 
         return attn
 
@@ -446,14 +444,13 @@ class _MultiGridAttn(torch.autograd.Function):
         layer_idx = ctx.layer_idx
         layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
         cached_indices = ctx.cached_indices
+        sp_mask = ctx.sp_mask
+        causal = ctx.causal
         L = rows.shape[0]
 
         # re‐zero out masked positions so no grad leaks
-        special = (rows == 0)           # (L,)
-        sp_mask = special.unsqueeze(0) | special.unsqueeze(1)  # (L,L)
-        causal  = torch.triu(torch.ones(L,L,device=rows.device), diagonal=1).bool()
         full_mask = (sp_mask | causal).view(1,1,L,L)
-        grad_attn = grad_attn.masked_fill(full_mask, 0.0)
+        grad_attn.masked_fill_(full_mask, 0.0)
 
         # prepare zero‐buffers for param‐grads
         d_within = torch.zeros(layers, H, mh1, mw1,
@@ -500,10 +497,10 @@ class _MultiGridAttn(torch.autograd.Function):
                                                          g_xx)
 
         # only two grads; rest (rows, cols, lengths, layer_idx) get None
-        return d_within, d_across, None, None, None, None, None
+        return d_within, d_across, None, None, None, None, None, None, None
 
 class MultiGridAttention2(nn.Module):
-    def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int):
+    def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int, device: str = 'cuda'):
         super().__init__()
         
         # Within-grid attention (same for all grids)
@@ -525,7 +522,7 @@ class MultiGridAttention2(nn.Module):
                                 )
         # Initialize parameters (e.g., small random values or zeros)
         nn.init.normal_(self.across_grid_attn_bias, std=0.01)
-        
+        self.triu_mask = torch.triu(torch.ones(12288, 12288, device=device, dtype=torch.bool), diagonal=1)
         # State variables
         self.rows = None
         self.cols = None
@@ -533,6 +530,10 @@ class MultiGridAttention2(nn.Module):
         
         # Cache for computed indices
         self.cached_indices = None
+        
+        # Cache for masks
+        self.sp_mask = None
+        self.causal = None
     
     def set_indices(self, rows, cols, lengths):
         """Set the row, column indices and lengths for attention computation."""
@@ -543,6 +544,21 @@ class MultiGridAttention2(nn.Module):
         # Compute and cache indices
         del self.cached_indices
         self._compute_indices()
+        
+        # Compute and cache masks
+        self._compute_masks()
+    
+    def _compute_masks(self):
+        """Precompute special token mask and causal mask."""
+        L = self.rows.shape[0]
+        device = self.rows.device
+        
+        # Special token mask
+        special = (self.rows == 0)  # (L,)
+        self.sp_mask = special.unsqueeze(0) | special.unsqueeze(1)  # (L,L)
+        
+        # Causal mask
+        self.causal = self.triu_mask[:L, :L]
     
     def _compute_indices(self):
         """Precompute all indices needed for attention computation."""
@@ -601,7 +617,9 @@ class MultiGridAttention2(nn.Module):
             self.within_grid_attn_bias,
             self.across_grid_attn_bias,
             self.rows, self.cols, self.lengths, layer_idx,
-            self.cached_indices
+            self.cached_indices,
+            self.sp_mask,
+            self.causal
         )
 
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
