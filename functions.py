@@ -130,6 +130,53 @@ class PositionalEmbedding2D(nn.Module):
     def __call__(self, module, input, output):
         return self.forward(module, input, output)
     
+class _RelPos2D(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, bias_param, rows, cols, layer_idx):
+        # save just the *bare minimum* for backward
+        layers, H, max_h, max_w = bias_param.shape
+        ctx.save_for_backward(rows, cols)
+        ctx.layer_idx = layer_idx
+        ctx.max_h = max_h
+        ctx.max_w = max_w
+        ctx.layers = layers
+        ctx.H = H
+        # do exactly the same fancy indexing
+        h_idxs = torch.clamp(rows.unsqueeze(0) - rows.unsqueeze(1), 0, max_h-1)
+        w_idxs = torch.clamp(cols.unsqueeze(0) - cols.unsqueeze(1), 0, max_w-1)
+        out = bias_param[layer_idx:layer_idx+1, :, h_idxs, w_idxs]
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        rows, cols = ctx.saved_tensors
+        layer_idx, max_h, max_w, layers, H = ctx.layer_idx, ctx.max_h, ctx.max_w, ctx.layers, ctx.H
+        # rows and cols are 1-indexed, so it does not work with h_idxs * max_w + w_idxs
+        rows -= 1
+        cols -= 1
+        # 1) recompute the 2D offsets
+        h_idxs = torch.clamp(rows.unsqueeze(0) - rows.unsqueeze(1), 0, max_h-1)
+        w_idxs = torch.clamp(cols.unsqueeze(0) - cols.unsqueeze(1), 0, max_w-1)
+
+        # 2) flatten the 2D grid of offsets into single linear indices
+        #    idx_flat[i,j] = h_idxs[i,j] * max_width + w_idxs[i,j]
+        idx_flat = (h_idxs * max_w + w_idxs).view(-1)                  # (L*L,)
+
+        # 3) flatten grad_out too
+        g_flat = grad_out[0].view(H, -1)                               # (H, L*L)
+
+        # 4) make a zero grad buffer for the entire param
+        d_bias = torch.zeros(layers, H, max_h, max_w, device=grad_out.device, dtype=grad_out.dtype)  # (layers, H, max_h, max_w)
+
+        # 5) we only write into layer layer_idx, so take a view:
+        db_li = d_bias[layer_idx].view(H, -1)                                 # (H, max_h*max_w)
+
+        # 6) scatter_add along dim=1 using our flat indices
+        #    each head h adds g_flat[h,k] into db_li[h, idx_flat[k]]
+        db_li.scatter_add_(1, idx_flat.unsqueeze(0).expand(H, -1), g_flat)
+
+        return d_bias, None, None, None
+        
 class WithinGrid2DAttnScore(nn.Module):
     def __init__(self, layers, heads, max_height_delta, max_width_delta):
         super().__init__()
@@ -147,29 +194,25 @@ class WithinGrid2DAttnScore(nn.Module):
         # Initialize parameters (e.g., small random values or zeros)
         nn.init.normal_(self.relative_position_bias, std=0.01)
 
-    def forward(self, rows: torch.LongTensor, cols: torch.LongTensor):
+    def forward(self, rows: torch.LongTensor, cols: torch.LongTensor, layer_idx: int):
         # Compute distance matrices (L, L)
         height_indices = (rows.unsqueeze(0) - rows.unsqueeze(1))  # (L, L)
         width_indices = (cols.unsqueeze(0) - cols.unsqueeze(1))   # (L, L)
-
-        # Indices are (L, L), broadcast to (layers, heads, L, L)
-        scores = self.relative_position_bias[:, :, height_indices, width_indices] # (layers, heads, L, L)
-
-        # Causal mask: i > j -> -inf
-        # causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
-        # scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(torch.bfloat16).min)
-
+        height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
+        width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
+        # Return shape (1, heads, L, L)
+        scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
         return scores
     
 class AcrossGrid2DAttnScore(WithinGrid2DAttnScore):
     def __init__(self, layers, heads, max_height_delta, max_width_delta):
         super().__init__(layers, heads, max_height_delta, max_width_delta)
 
-    def forward(self, rows1: torch.LongTensor, cols1: torch.LongTensor, rows2: torch.LongTensor, cols2: torch.LongTensor):
+    def forward(self, rows1: torch.LongTensor, cols1: torch.LongTensor, rows2: torch.LongTensor, cols2: torch.LongTensor, layer_idx: int):
         '''
         rows1, cols1 are the coordinates of the input grid of shape (L,)
         rows2, cols2 are the coordinates of the output grid of shape (l,)
-        returns a tensor of shape (layers, heads, l, L), relative bias is left corner aligned, i.e. input (0,0) is aligned with output (0,0)
+        returns a tensor of shape (1, heads, l, L), relative bias is left corner aligned, i.e. input (0,0) is aligned with output (0,0)
         '''
         # Compute distance matrices (l, L)
         height_indices = (rows2.unsqueeze(1) - rows1.unsqueeze(0))  # (l, L)
@@ -183,8 +226,8 @@ class AcrossGrid2DAttnScore(WithinGrid2DAttnScore):
         height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
         width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
 
-        # Indices are (l, L), broadcast to (layers, heads, l, L)
-        scores = self.relative_position_bias[:, :, height_indices, width_indices] # (layers, heads, l, L)
+        # Return shape (1, heads, l, L)
+        scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
 
         # Causal mask: i > j -> -inf
         # causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
@@ -223,27 +266,36 @@ class MultiGridAttention(nn.Module):
         self.across_grid_attn = AcrossGrid2DAttnScore(
             layers, heads, max_height_delta2, max_width_delta2
         )
+        
+        # State variables
+        self.rows = None
+        self.cols = None
+        self.lengths = None
     
-    def forward(self, rows, cols, lengths):
+    def set_indices(self, rows, cols, lengths):
+        """Set the row, column indices and lengths for attention computation."""
+        self.rows = rows
+        self.cols = cols
+        self.lengths = lengths
+    
+    def forward(self, layer_idx):
         """
         Constructs a full attention score matrix combining within-grid and across-grid attention.
         
         Args:
-            rows: Tensor of row indices for all tokens, shape (L,)
-            cols: Tensor of column indices for all tokens, shape (L,)
-            lengths: List of lengths for each grid [len(x_1), len(y_1), len(x_2), len(y_2), ...]
+            layer_idx: Int specifying which layer's attention scores to return
             
         Returns:
-            attention_biases: Tensor of shape (layers, heads, L, L) containing all attention biases
+            attention_biases: Tensor of shape (1, heads, L, L)
         """
+        rows, cols, lengths = self.rows, self.cols, self.lengths
         device = rows.device
         total_length = rows.size(0)
-        layers = self.within_grid_attn.layers
         heads = self.within_grid_attn.heads
         
         # Initialize attention bias matrix with zeros
         attention_biases = torch.zeros(
-            (layers, heads, total_length, total_length), 
+            (1, heads, total_length, total_length), 
             device=device
         )
         
@@ -270,15 +322,15 @@ class MultiGridAttention(nn.Module):
             y_cols = cols[y_start:y_end]
             
             # 1. Within-grid attention for input (x_i to x_i)
-            x_to_x_bias = self.within_grid_attn(x_rows, x_cols)
+            x_to_x_bias = self.within_grid_attn(x_rows, x_cols, layer_idx)
             attention_biases[:, :, x_start:x_end, x_start:x_end] = x_to_x_bias
             
             # 2. Within-grid attention for output (y_i to y_i)
-            y_to_y_bias = self.within_grid_attn(y_rows, y_cols)
+            y_to_y_bias = self.within_grid_attn(y_rows, y_cols, layer_idx)
             attention_biases[:, :, y_start:y_end, y_start:y_end] = y_to_y_bias
             
             # 3. Across-grid attention for output attending to input (y_i to x_i)
-            y_to_x_bias = self.across_grid_attn(x_rows, x_cols, y_rows, y_cols)
+            y_to_x_bias = self.across_grid_attn(x_rows, x_cols, y_rows, y_cols, layer_idx)
             attention_biases[:, :, y_start:y_end, x_start:x_end] = y_to_x_bias
             
             # Update current position
@@ -295,7 +347,7 @@ class MultiGridAttention(nn.Module):
             x_cols = cols[x_start:x_end]
             
             # Only apply within-grid attention for the unpaired input
-            x_to_x_bias = self.within_grid_attn(x_rows, x_cols)
+            x_to_x_bias = self.within_grid_attn(x_rows, x_cols, layer_idx)
             attention_biases[:, :, x_start:x_end, x_start:x_end] = x_to_x_bias
             
             # Update current position
@@ -305,10 +357,10 @@ class MultiGridAttention(nn.Module):
         special_token_mask = (rows == 0)
         # Create mask for special tokens in attention matrix (both rows and columns)
         special_row_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
-            layers, heads, total_length, total_length
+            1, heads, total_length, total_length
         )
         special_col_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
-            layers, heads, total_length, total_length
+            1, heads, total_length, total_length
         )
             
         # Zero out attention scores for special tokens
@@ -326,7 +378,150 @@ class MultiGridAttention(nn.Module):
         )
         
         return attention_biases
-        
+
+class _MultiGridAttn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,
+                within_bias,    # (layers, H, mh1, mw1)
+                across_bias,    # (layers, H, mh2, mw2)
+                rows,           # (L,)
+                cols,           # (L,)
+                lengths,        # list of ints
+                layer_idx       # int
+               ):
+        # unpack some shapes
+        layers, H, mh1, mw1 = within_bias.shape
+        _,   _, mh2, mw2 = across_bias.shape
+        L = rows.shape[0]
+
+        # build the full bias matrix exactly as your original forward:
+        attn = torch.zeros((1, H, L, L),
+                           device=rows.device,
+                           dtype=within_bias.dtype)
+
+        cur = 0
+        lens = lengths
+        Npairs = len(lens)//2
+        has_tail = (len(lens)%2==1)
+
+        for i in range(Npairs):
+            lx, ly = lens[2*i], lens[2*i+1]
+            xs, xe = cur, cur+lx
+            ys, ye = xe,  ye = xe+ly
+
+            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
+            y_rows = rows[ys:ye]; y_cols = cols[ys:ye]
+
+            # within x→x
+            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1)
+            attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
+
+            # within y→y
+            hdy = torch.clamp(y_rows.unsqueeze(0)-y_rows.unsqueeze(1), 0, mh1-1)
+            wdy = torch.clamp(y_cols.unsqueeze(0)-y_cols.unsqueeze(1), 0, mw1-1)
+            attn[:, :, ys:ye, ys:ye] = within_bias[layer_idx:layer_idx+1, :, hdy, wdy]
+
+            # across y→x
+            hdxy = torch.clamp(y_rows.unsqueeze(1)-x_rows.unsqueeze(0), 0, mh2-1)
+            wdxy = torch.clamp(y_cols.unsqueeze(1)-x_cols.unsqueeze(0), 0, mw2-1)
+            attn[:, :, ys:ye, xs:xe] = across_bias[layer_idx:layer_idx+1, :, hdxy, wdxy]
+
+            cur = ye
+
+        if has_tail:
+            lx = lens[-1]
+            xs, xe = cur, cur+lx
+            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
+            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1)
+            attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
+
+        # (optionally re‐apply your special‐token zeroing and causal mask here…)
+
+        # SAVE ONLY the tiny things
+        ctx.save_for_backward(rows, cols)
+        ctx.lengths   = lens
+        ctx.layer_idx = layer_idx
+        ctx.shapes    = (layers, H, mh1, mw1, mh2, mw2)
+
+        return attn
+
+    @staticmethod
+    def backward(ctx, grad_attn):
+        # unpack
+        rows, cols = ctx.saved_tensors
+        lens       = ctx.lengths
+        layer_idx  = ctx.layer_idx
+        layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
+        L = rows.shape[0]
+
+        # zero‐buffers for each parameter
+        d_within = torch.zeros(layers, H, mh1, mw1,
+                               device=grad_attn.device,
+                               dtype=grad_attn.dtype)
+        d_across = torch.zeros(layers, H, mh2, mw2,
+                               device=grad_attn.device,
+                               dtype=grad_attn.dtype)
+
+        cur = 0
+        Npairs = len(lens)//2
+        has_tail = (len(lens)%2==1)
+
+        for i in range(Npairs):
+            lx, ly = lens[2*i], lens[2*i+1]
+            xs, xe = cur, cur+lx
+            ys, ye = xe, xe+ly
+
+            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
+            y_rows = rows[ys:ye]; y_cols = cols[ys:ye]
+
+            # grad for within x→x
+            g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)  # (H, lx*lx)
+            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
+            idx = hdx*mw1 + wdx   # (lx*lx,)
+            d_within[layer_idx].view(H, -1).scatter_add_(1,
+                                                        idx.unsqueeze(0).expand(H, -1),
+                                                        g_xx)
+
+            # within y→y
+            g_yy = grad_attn[0, :, ys:ye, ys:ye].reshape(H, -1)
+            hdy = torch.clamp(y_rows.unsqueeze(0)-y_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
+            wdy = torch.clamp(y_cols.unsqueeze(0)-y_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
+            idx = hdy*mw1 + wdy
+            d_within[layer_idx].view(H, -1).scatter_add_(1,
+                                                        idx.unsqueeze(0).expand(H, -1),
+                                                        g_yy)
+
+            # across y→x
+            g_yx = grad_attn[0, :, ys:ye, xs:xe].reshape(H, -1)    # (H, ly*lx)
+            hdxy = torch.clamp(y_rows.unsqueeze(1)-x_rows.unsqueeze(0), 0, mh2-1).reshape(-1)
+            wdxy = torch.clamp(y_cols.unsqueeze(1)-x_cols.unsqueeze(0), 0, mw2-1).reshape(-1)
+            idx = hdxy*mw2 + wdxy
+            d_across[layer_idx].view(H, -1).scatter_add_(1,
+                                                        idx.unsqueeze(0).expand(H, -1),
+                                                        g_yx)
+
+            cur = ye
+
+        if has_tail:
+            lx = lens[-1]
+            xs, xe = cur, cur+lx
+            x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
+            g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
+            hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
+            wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
+            idx = hdx*mw1 + wdx
+            d_within[layer_idx].view(H, -1).scatter_add_(1,
+                                                        idx.unsqueeze(0).expand(H, -1),
+                                                        g_xx)
+
+        # no grads w.r.t rows, cols, lengths, layer_idx
+        return d_within, d_across, None, None, None, None
+
+
+      
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
                                          max_seq_length = max_seq_length,
