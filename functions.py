@@ -397,7 +397,7 @@ class _MultiGridAttn(torch.autograd.Function):
         # build the full bias matrix exactly as your original forward:
         attn = torch.zeros((1, H, L, L),
                            device=rows.device,
-                           dtype=within_bias.dtype)
+                           dtype=torch.bfloat16)
 
         cur = 0
         lens = lengths
@@ -407,7 +407,7 @@ class _MultiGridAttn(torch.autograd.Function):
         for i in range(Npairs):
             lx, ly = lens[2*i], lens[2*i+1]
             xs, xe = cur, cur+lx
-            ys, ye = xe,  ye = xe+ly
+            ys, ye = xe,  xe+ly
 
             x_rows = rows[xs:xe]; x_cols = cols[xs:xe]
             y_rows = rows[ys:ye]; y_cols = cols[ys:ye]
@@ -437,9 +437,26 @@ class _MultiGridAttn(torch.autograd.Function):
             wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1)
             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
 
-        # (optionally re‐apply your special‐token zeroing and causal mask here…)
+        # 1. Special token handling: zero out rows/cols where row value is 0 (special tokens)
+        special_token_mask = (rows == 0)
+        # Create mask for special tokens in attention matrix (both rows and columns)
+        special_row_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(1, H, L, L)
+        special_col_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, H, L, L)
+        # Zero out attention scores for special tokens
+        attn.masked_fill_(special_row_mask, 0.0)
+        attn.masked_fill_(special_col_mask, 0.0)
+        
+        # 2. Apply causal mask to ensure past tokens don't attend to future tokens
+        causal_mask = torch.triu(
+            torch.ones(L, L, device=rows.device), 
+            diagonal=1
+        ).bool()
+        attn.masked_fill_(
+            causal_mask.unsqueeze(0).unsqueeze(0), 
+            torch.finfo(torch.bfloat16).min  # Use -inf for bfloat16
+        )
 
-        # SAVE ONLY the tiny things
+        # SAVE for backward pass
         ctx.save_for_backward(rows, cols)
         ctx.lengths   = lens
         ctx.layer_idx = layer_idx
@@ -455,6 +472,20 @@ class _MultiGridAttn(torch.autograd.Function):
         layer_idx  = ctx.layer_idx
         layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
         L = rows.shape[0]
+        # ----- zero out the masked positions -----
+        # 1) special tokens (rows==0) cannot produce grad
+        special = (rows == 0)                                       # (L,)
+        special_mask = special.unsqueeze(0) | special.unsqueeze(1)  # (L,L)
+
+        # 2) causal mask (i<j) was set to -inf
+        causal_mask = torch.triu(torch.ones(L, L,
+                               device=rows.device), diagonal=1).bool()
+
+        # combine
+        full_mask = (special_mask | causal_mask)    # (L,L)
+        # expand into the (1,H,L,L) grad
+        fm = full_mask.unsqueeze(0).unsqueeze(0)    # (1,1,L,L)
+        grad_attn.masked_fill_(fm, 0.0)  # zero out those gradients
 
         # zero‐buffers for each parameter
         d_within = torch.zeros(layers, H, mh1, mw1,
@@ -467,7 +498,8 @@ class _MultiGridAttn(torch.autograd.Function):
         cur = 0
         Npairs = len(lens)//2
         has_tail = (len(lens)%2==1)
-
+        rows -= 1 # rows / cols are 1-index. should be 0 index for hdx*mw1 + wdx
+        cols -= 1
         for i in range(Npairs):
             lx, ly = lens[2*i], lens[2*i+1]
             xs, xe = cur, cur+lx
@@ -480,7 +512,7 @@ class _MultiGridAttn(torch.autograd.Function):
             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)  # (H, lx*lx)
             hdx = torch.clamp(x_rows.unsqueeze(0)-x_rows.unsqueeze(1), 0, mh1-1).reshape(-1)
             wdx = torch.clamp(x_cols.unsqueeze(0)-x_cols.unsqueeze(1), 0, mw1-1).reshape(-1)
-            idx = hdx*mw1 + wdx   # (lx*lx,)
+            idx = hdx*mw1 + wdx
             d_within[layer_idx].view(H, -1).scatter_add_(1,
                                                         idx.unsqueeze(0).expand(H, -1),
                                                         g_xx)
@@ -520,7 +552,48 @@ class _MultiGridAttn(torch.autograd.Function):
         # no grads w.r.t rows, cols, lengths, layer_idx
         return d_within, d_across, None, None, None, None
 
+class MultiGridAttention2(nn.Module):
+    def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int):
+        super().__init__()
+        
+        # Within-grid attention (same for all grids)
+        self.within_grid_attn_bias = nn.Parameter(
+                                    torch.empty(layers,
+                                                heads,
+                                                max_height_delta1,
+                                                max_width_delta1)
+                                )
+        # Initialize parameters (e.g., small random values or zeros)
+        nn.init.normal_(self.within_grid_attn_bias, std=0.01)
+        
+        # Across-grid attention (for y_i attending to x_i)
+        self.across_grid_attn_bias = nn.Parameter(
+                                    torch.empty(layers,
+                                                heads,
+                                                max_height_delta2,
+                                                max_width_delta2)
+                                )
+        # Initialize parameters (e.g., small random values or zeros)
+        nn.init.normal_(self.across_grid_attn_bias, std=0.01)
+        
+        # State variables
+        self.rows = None
+        self.cols = None
+        self.lengths = None
+    
+    def set_indices(self, rows, cols, lengths):
+        """Set the row, column indices and lengths for attention computation."""
+        self.rows = rows
+        self.cols = cols
+        self.lengths = lengths
 
+    def forward(self, layer_idx):
+        # rows, cols, lengths are already stored as tensors / python list
+        return _MultiGridAttn.apply(
+            self.within_grid_attn_bias,
+            self.across_grid_attn_bias,
+            self.rows, self.cols, self.lengths, layer_idx
+        )
       
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
