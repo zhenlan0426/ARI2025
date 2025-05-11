@@ -52,5 +52,19 @@
          # )
          causal_mask = attention_mask
       ```
-7. 
-
+   - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py (line 244)
+      ```python
+         # attention_mask[self.layer_idx:self.layer_idx+1],
+         attn_output, attn_weights = attention_interface(
+                                                         self,
+                                                         query_states,
+                                                         key_states,
+                                                         value_states,
+                                                         self.multi_grid_attention(self.layer_idx), # 4d attention mask
+                                                         dropout=0.0 if not self.training else self.attention_dropout,
+                                                         scaling=self.scaling,
+                                                         sliding_window=self.sliding_window,
+                                                         **kwargs,
+                                                   )
+      ```
+      attention_mask is of shape (layers, heads, seq_len, seq_len) from MultiGridAttention. only works when batch size is 1
