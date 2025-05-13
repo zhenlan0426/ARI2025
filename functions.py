@@ -380,6 +380,7 @@ class MultiGridAttention(nn.Module):
         return attention_biases
 
 class _MultiGridAttn(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx,
                 within_bias,    # (layers, H, mh1, mw1)
@@ -426,8 +427,8 @@ class _MultiGridAttn(torch.autograd.Function):
         # --- causal mask ---
         attn.masked_fill_(causal.view(1,1,L,L), torch.finfo(attn.dtype).min)
 
-        # save only tiny things
-        ctx.save_for_backward(rows, cols)
+        # Save input tensors for backward
+        ctx.save_for_backward(rows, cols, within_bias, across_bias)  # Save original tensors
         ctx.lengths = lengths
         ctx.layer_idx = layer_idx
         ctx.shapes = (layers, H, mh1, mw1, mh2, mw2)
@@ -439,7 +440,7 @@ class _MultiGridAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_attn):
-        rows, cols = ctx.saved_tensors
+        rows, cols, within_bias, across_bias = ctx.saved_tensors
         lengths = ctx.lengths
         layer_idx = ctx.layer_idx
         layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
@@ -452,52 +453,49 @@ class _MultiGridAttn(torch.autograd.Function):
         full_mask = (sp_mask | causal).view(1,1,L,L)
         grad_attn.masked_fill_(full_mask, 0.0)
 
-        # prepare zero‐buffers for param‐grads
-        d_within = torch.zeros(layers, H, mh1, mw1,
-                               device=grad_attn.device,
-                               dtype=grad_attn.dtype)
-        d_across = torch.zeros(layers, H, mh2, mw2,
-                               device=grad_attn.device,
-                               dtype=grad_attn.dtype)
+        # Create empty grad tensors with same shape as inputs if they don't exist
+        if within_bias.grad is None:
+            within_bias.grad = torch.zeros_like(within_bias, device=within_bias.device, dtype=within_bias.dtype)
+        if across_bias.grad is None:
+            across_bias.grad = torch.zeros_like(across_bias, device=across_bias.device, dtype=across_bias.dtype)
 
         Npairs = len(lengths)//2
         has_tail = (len(lengths)%2==1)
-        rows -= 1 # rows / cols are 1-index. should be 0 index for hdx*mw1 + wdx
-        cols -= 1
         
         for i in range(Npairs):
             # Use cached indices for gradients
             hdx, wdx, xs, xe = cached_indices[f'x2x_{i}']
             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
             idx = hdx.reshape(-1) * mw1 + wdx.reshape(-1)
-            d_within[layer_idx].view(H, -1).scatter_add_(1,
+            # Accumulate directly into .grad attribute
+            within_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
-                                                         g_xx)
+                                                         g_xx.to(within_bias.dtype))
             
             hdy, wdy, ys, ye = cached_indices[f'y2y_{i}']
             g_yy = grad_attn[0, :, ys:ye, ys:ye].reshape(H, -1)
             idx = hdy.reshape(-1) * mw1 + wdy.reshape(-1)
-            d_within[layer_idx].view(H, -1).scatter_add_(1,
+            within_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
-                                                         g_yy)
+                                                         g_yy.to(within_bias.dtype))
             
             hdxy, wdxy, ys, ye, xs, xe = cached_indices[f'y2x_{i}']
             g_yx = grad_attn[0, :, ys:ye, xs:xe].reshape(H, -1)
             idx = hdxy.reshape(-1) * mw2 + wdxy.reshape(-1)
-            d_across[layer_idx].view(H, -1).scatter_add_(1,
+            across_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
-                                                         g_yx)
+                                                         g_yx.to(across_bias.dtype))
 
         if has_tail:
             hdx, wdx, xs, xe = cached_indices['tail']
             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
             idx = hdx.reshape(-1) * mw1 + wdx.reshape(-1)
-            d_within[layer_idx].view(H, -1).scatter_add_(1,
+            within_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
                                                          idx.unsqueeze(0).expand(H, -1),
-                                                         g_xx)
+                                                         g_xx.to(within_bias.dtype))
 
-        # only two grads; rest (rows, cols, lengths, layer_idx) get None
-        return d_within, d_across, None, None, None, None, None, None, None
+        # Return None for gradients as we've directly modified the .grad attributes
+        return None, None, None, None, None, None, None, None, None
 
 class MultiGridAttention2(nn.Module):
     def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int, device: str = 'cuda'):
