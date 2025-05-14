@@ -385,23 +385,20 @@ class _MultiGridAttn(torch.autograd.Function):
     def forward(ctx,
                 within_bias,    # (layers, H, mh1, mw1)
                 across_bias,    # (layers, H, mh2, mw2)
-                rows,           # (L,)  LongTensor, 0-based coords
-                cols,           # (L,)  LongTensor, 0-based coords
                 lengths,        # small Python list of ints
                 layer_idx,      # int
                 cached_indices, # dict of precomputed indices
                 sp_mask,        # (L,L)
-                causal         # (L,L)
+                causal,         # (L,L)
+                attn           # (1, H, L, L)
                ):
         # unpack
         layers, H, mh1, mw1 = within_bias.shape
         _,      _, mh2, mw2 = across_bias.shape
-        L = rows.shape[0]
+        L = attn.shape[2]
 
-        # build the full bias
-        attn = torch.zeros((1, H, L, L),
-                           device=rows.device,
-                           dtype=torch.bfloat16)
+        # Zero out the attention tensor
+        # attn.zero_()
 
         Npairs = len(lengths)//2
         has_tail = (len(lengths) % 2 == 1)
@@ -409,7 +406,7 @@ class _MultiGridAttn(torch.autograd.Function):
         for i in range(Npairs):
             # Use cached indices
             hdx, wdx, xs, xe = cached_indices[f'x2x_{i}']
-            attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
+            attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx] # += to avoid overwriting as we zeroed out the attention
             
             hdy, wdy, ys, ye = cached_indices[f'y2y_{i}']
             attn[:, :, ys:ye, ys:ye] = within_bias[layer_idx:layer_idx+1, :, hdy, wdy]
@@ -428,7 +425,7 @@ class _MultiGridAttn(torch.autograd.Function):
         attn.masked_fill_(causal.view(1,1,L,L), torch.finfo(attn.dtype).min)
 
         # Save input tensors for backward
-        ctx.save_for_backward(rows, cols, within_bias, across_bias)  # Save original tensors
+        ctx.save_for_backward(within_bias, across_bias)  # Save original tensors
         ctx.lengths = lengths
         ctx.layer_idx = layer_idx
         ctx.shapes = (layers, H, mh1, mw1, mh2, mw2)
@@ -440,14 +437,14 @@ class _MultiGridAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_attn):
-        rows, cols, within_bias, across_bias = ctx.saved_tensors
+        within_bias, across_bias = ctx.saved_tensors
         lengths = ctx.lengths
         layer_idx = ctx.layer_idx
         layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
         cached_indices = ctx.cached_indices
         sp_mask = ctx.sp_mask
         causal = ctx.causal
-        L = rows.shape[0]
+        L = grad_attn.shape[2]
 
         # re‐zero out masked positions so no grad leaks
         full_mask = (sp_mask | causal).view(1,1,L,L)
@@ -495,7 +492,7 @@ class _MultiGridAttn(torch.autograd.Function):
                                                          g_xx.to(within_bias.dtype))
 
         # Return None for gradients as we've directly modified the .grad attributes
-        return None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None,
 
 class MultiGridAttention2(nn.Module):
     def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int, device: str = 'cuda'):
@@ -508,8 +505,18 @@ class MultiGridAttention2(nn.Module):
                                                 max_height_delta1,
                                                 max_width_delta1)
                                 )
-        # Initialize parameters (e.g., small random values or zeros)
-        nn.init.normal_(self.within_grid_attn_bias, std=0.01)
+        # Initialize with 2D multivariate normal centered at (0,0) with different std per head
+        pattern = self._attention_init(
+            heads=heads,
+            max_height=max_height_delta1,
+            max_width=max_width_delta1,
+            start_std=1,
+            end_std=20,
+            is_centered=False,
+            device=device
+        )
+        # Apply the same pattern to all layers
+        self.within_grid_attn_bias.data = pattern.view(1, heads, max_height_delta1, max_width_delta1).repeat(layers, 1, 1, 1)
         
         # Across-grid attention (for y_i attending to x_i)
         self.across_grid_attn_bias = nn.Parameter(
@@ -518,8 +525,21 @@ class MultiGridAttention2(nn.Module):
                                                 max_height_delta2,
                                                 max_width_delta2)
                                 )
-        # Initialize parameters (e.g., small random values or zeros)
-        nn.init.normal_(self.across_grid_attn_bias, std=0.01)
+        
+        # Initialize with 2D multivariate normal centered at (max_height_delta2//2, max_width_delta2//2)
+        pattern = self._attention_init(
+            heads=heads,
+            max_height=max_height_delta2,
+            max_width=max_width_delta2,
+            start_std=1,
+            end_std=20,
+            is_centered=True,
+            device=device
+        )
+        
+        # Apply the same pattern to all layers
+        self.across_grid_attn_bias.data = pattern.view(1, heads, max_height_delta2, max_width_delta2).repeat(layers, 1, 1, 1) 
+
         self.triu_mask = torch.triu(torch.ones(12288, 12288, device=device, dtype=torch.bool), diagonal=1)
         # State variables
         self.rows = None
@@ -532,6 +552,31 @@ class MultiGridAttention2(nn.Module):
         # Cache for masks
         self.sp_mask = None
         self.causal = None
+        self.heads = heads
+        self.device = device
+
+    @staticmethod
+    def _attention_init(heads, max_height, max_width, start_std=0.5, end_std=15, is_centered=False, device='cuda'):
+        """init with a 2D multivariate normal pdf pattern."""
+        # Create log-linear spaced std values between start_std and end_std
+        std = start_std * (end_std/start_std) ** (torch.arange(heads, device=device).float() / (heads - 1)).view(heads, 1, 1)
+        
+        # Create coordinate grid
+        y_coords = torch.arange(max_height, device=device).float().view(1, max_height, 1)
+        x_coords = torch.arange(max_width, device=device).float().view(1, 1, max_width)
+        
+        if is_centered:
+            center_h = max_height // 2
+            center_w = max_width // 2
+            squared_dist = ((y_coords - center_h) ** 2) + ((x_coords - center_w) ** 2)
+        else:
+            # Calculate distance from (0,0)
+            squared_dist = (y_coords ** 2) + (x_coords ** 2)
+            
+        # Apply 2D normal distribution formula (without normalization constant)
+        pattern = torch.exp(-squared_dist / (2 * std ** 2))
+        
+        return pattern
     
     def set_indices(self, rows, cols, lengths):
         """Set the row, column indices and lengths for attention computation."""
@@ -545,6 +590,8 @@ class MultiGridAttention2(nn.Module):
         
         # Compute and cache masks
         self._compute_masks()
+        # Create attention tensor once
+        self.attn = torch.zeros((1, self.heads, rows.shape[0], rows.shape[0]), device=self.device, dtype=torch.bfloat16)
     
     def _compute_masks(self):
         """Precompute special token mask and causal mask."""
@@ -614,10 +661,11 @@ class MultiGridAttention2(nn.Module):
         return _MultiGridAttn.apply(
             self.within_grid_attn_bias,
             self.across_grid_attn_bias,
-            self.rows, self.cols, self.lengths, layer_idx,
+            self.lengths, layer_idx,
             self.cached_indices,
             self.sp_mask,
-            self.causal
+            self.causal,
+            self.attn
         )
 
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
