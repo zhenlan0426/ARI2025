@@ -201,7 +201,10 @@ class WithinGrid2DAttnScore(nn.Module):
         height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
         width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
         # Return shape (1, heads, L, L)
-        scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
+        if self.layers == 1:
+            scores = self.relative_position_bias[:, :, height_indices, width_indices]
+        else:
+            scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
         return scores
     
 class AcrossGrid2DAttnScore(WithinGrid2DAttnScore):
@@ -227,7 +230,10 @@ class AcrossGrid2DAttnScore(WithinGrid2DAttnScore):
         width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
 
         # Return shape (1, heads, l, L)
-        scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
+        if self.layers == 1:
+            scores = self.relative_position_bias[:, :, height_indices, width_indices]
+        else:
+            scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
 
         # Causal mask: i > j -> -inf
         # causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
