@@ -747,7 +747,7 @@ def shrink_grid_n_times(enlarged_grid, n, m):
         original_grid.append(original_row)
     return original_grid
 
-def generateTransformPara(n, apply_to_output=False):
+
 def generateTransformPara(n, apply_to_output=False):
     """Randomly generates transformation parameters"""
     # n is the number of examples
@@ -756,7 +756,7 @@ def generateTransformPara(n, apply_to_output=False):
                          np.random.permutation(n),\
                         #  (np.random.randint(1, 3), np.random.randint(1, 3)),\
                         1 if apply_to_output else np.random.randint(0, 2))
-                        1 if apply_to_output else np.random.randint(0, 2))
+
 
 def forward(x, tpara:TransformPara):
     """Applies transformations to a single grid."""
@@ -1231,7 +1231,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True, apply_to_output=False):
+
 def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True, apply_to_output=False):
     """Generate data for training or testing.
     
