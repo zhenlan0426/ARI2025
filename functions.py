@@ -538,7 +538,7 @@ class MultiGridAttention2(nn.Module):
             max_height=max_height_delta2,
             max_width=max_width_delta2,
             start_std=1,
-            end_std=20,
+            end_std=35,
             is_centered=True,
             device=device
         )
@@ -746,14 +746,14 @@ def shrink_grid_n_times(enlarged_grid, n, m):
         original_grid.append(original_row)
     return original_grid
 
-def generateTransformPara(n):
+def generateTransformPara(n, apply_to_output=False):
     """Randomly generates transformation parameters"""
     # n is the number of examples
     # (fliplr, rot90, permutate color, permutate example, enlarge, apply to output)
     return TransformPara(np.random.randint(0, 2), np.random.randint(0, 4), np.random.permutation(10), \
                          np.random.permutation(n),\
                         #  (np.random.randint(1, 3), np.random.randint(1, 3)),\
-                         np.random.randint(0, 2))
+                        1 if apply_to_output else np.random.randint(0, 2))
 
 def forward(x, tpara:TransformPara):
     """Applies transformations to a single grid."""
@@ -1228,7 +1228,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True):
+def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True, apply_to_output=False):
     """Generate data for training or testing.
     
     Args:
@@ -1256,7 +1256,7 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
         # Apply transformations only during training
         if IsTrain:
             # TODO: tansformation for decode
-            task = forwardTask(task, generateTransformPara(len(task)))
+            task = forwardTask(task, generateTransformPara(len(task), apply_to_output=apply_to_output))
         
         # Tokenize the task
         out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition, ReturnLengths=ReturnLengths)
@@ -2091,3 +2091,43 @@ def check(decoder,targets):
     best_res = check_grid(targets, decoder.best_paths[idx])
     any_res = max((check_grid(targets, grid) for grid in decoder.best_paths))
     return best_res, any_res
+
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+def plot_attention_patterns(pattern, layers=0, num_heads=32, rows=4, cols=8, figsize=(20, 10), title='Attention Patterns for Different Heads'):
+    """
+    Plot attention patterns for different heads.
+    
+    Args:
+        pattern: Tensor containing attention patterns for different heads
+        num_heads: Number of attention heads to plot
+        rows: Number of rows in the subplot grid
+        cols: Number of columns in the subplot grid
+        figsize: Figure size as (width, height)
+        title: Title for the overall figure
+    """
+    pattern = pattern[layers]
+    # Create a figure with subplots for different heads
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    axes = axes.flatten()
+
+    # Plot each head's pattern
+    for h in range(num_heads):
+        ax = axes[h]
+        im = ax.imshow(pattern[h].detach().cpu().numpy(), cmap='viridis')
+        ax.set_title(f'Head {h}')
+        ax.set_xlabel('Width')
+        ax.set_ylabel('Height')
+        
+        # Add colorbar for each subplot
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        plt.colorbar(im, cax=cax)
+
+    # Adjust layout
+    plt.tight_layout()
+    plt.suptitle(title, fontsize=16)
+    plt.subplots_adjust(top=0.92)
+    
+    return fig
