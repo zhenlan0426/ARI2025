@@ -1,7 +1,10 @@
-#### ARI2025 - Lessons
+### ARI2025 - ARC
+Problem: To solve ARC AGI problem using VLM. each task is represented as (input1, output1),(input2, output2),... (inputN, outputN), where input and output are 2d grid of integer between 0 and 9. Our goal is to given all history up till inputN, and predict outputN.
+#### Custom attention mask
 1. Based on Fine_Tune copy 2, 3, 5. mask does not seem to matter. branch off from functions_old
 2. BOS_Y -> row -> col does not work well as model predict row and then proceed to predict cell 1 as shown in
    Fine_Tune copy 4. row_special_token -> row and col_special_token -> col
+#### VLM
 3. VLM modifications:
       - position embedding
       - processing
@@ -36,14 +39,15 @@
                   seq_len = attention_mask.shape[-1]
                   key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
          ```
-4. I am trying to solve ARC AGI problem using VLM. each task is represented as (input1, output1),(input2, output2),... (inputN, outputN), where input and output are 2d grid of integer between 0 and 9. Our goal is to given all history up till inputN, and predict outputN. 
-
+      - Gemma3 images will attend to all other images even when injected in between "text". This will break causality for ARC problem.
+      - More importantly, the vision tower is nothing more than a bi-directional transformer, similar to the LLM. and the input to the vision tower "color" contains the same information as the "text" with superficial format (image is arbitrary RGB and text is 0 ~ 9 token). Essentially, processing the same information twice. CNN based U-net might be a better choice to capture the spatial information.
 5. StaticCache Modifications
    - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/transformers/cache_utils.py (line 1276). Together with cache_position will ensure
       DFS properly backtrack since Cache is not a copy.
       ```python        
          return k_out[:, :, :cache_position[-1].item()+1], v_out[:, :, :cache_position[-1].item()+1]
          ```
+#### Relative Position Bias
 6. 4d position based attention mask. _update_causal_mask will ingore 4d attention mask passed in.
    - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py (line 546)
       ```python
@@ -68,3 +72,8 @@
                                                    )
       ```
       attention_mask is of shape (layers, heads, seq_len, seq_len) from MultiGridAttention. only works when batch size is 1
+- Tried seperate parameter for different layers or same parameter for all layers. No difference in performance. **grad is really small (1e-8)**. model performance is worse when RoPE is disabled (due to difference from pretrain?)
+- Implement custom backward pass for relative position bias (MultiGridAttention2) for better VRAM management.
+- Future work: 
+   - test without RoPE and disable input only transformation to ease learning.
+   - parametrize attention score with MLP(relative row and col) -> bias
