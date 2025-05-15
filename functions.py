@@ -539,7 +539,6 @@ class MultiGridAttention2(nn.Module):
             max_width=max_width_delta2,
             start_std=1,
             end_std=35,
-            end_std=35,
             is_centered=True,
             device=device
         )
@@ -675,6 +674,81 @@ class MultiGridAttention2(nn.Module):
             self.attn
         )
 
+# def apply_rotary_pos_emb(q, k, cos_expanded, sin_expanded, cos, sin, position_ids=None, unsqueeze_dim=1):
+#     """Applies Rotary Position Embedding to the query and key tensors.
+
+#     Args:
+#         q (`torch.Tensor`): The query tensor.
+#         k (`torch.Tensor`): The key tensor.
+#         cos (`torch.Tensor`): The cosine part of the rotary embedding.
+#         sin (`torch.Tensor`): The sine part of the rotary embedding.
+#         position_ids (`torch.Tensor`, *optional*):
+#             Deprecated and unused.
+#         unsqueeze_dim (`int`, *optional*, defaults to 1):
+#             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+#             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+#             that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+#             k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+#             cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+#             the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+#     Returns:
+#         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+#     """
+
+#     # cos = cos.unsqueeze(unsqueeze_dim)
+#     # sin = sin.unsqueeze(unsqueeze_dim)
+#     # cos (1, 8, seq_len, head_dim) -> repeat to (1, 32, seq_len, head_dim)
+#     q_embed = (q * cos_expanded) + (rotate_half(q) * sin_expanded)
+#     k_embed = (k * cos) + (rotate_half(k) * sin)
+#     return q_embed, k_embed
+    
+# class Qwen3RotaryEmbedding2d(nn.Module):
+#     def __init__(self, config: Qwen3Config, max_head_freq=100, device=None):
+#         super().__init__()
+#         # BC: "rope_type" was originally "type"
+#         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+#             self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+#         else:
+#             self.rope_type = "default"
+#         self.max_seq_len_cached = config.max_position_embeddings
+#         self.original_max_seq_len = config.max_position_embeddings
+
+#         self.config = config
+#         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+#         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+#         mask = torch.arange(len(inv_freq)) % 2 == 0
+#         freq_x = inv_freq.clone()
+#         freq_y = inv_freq.clone()
+#         freq_x[~mask] = 0.0
+#         freq_y[mask] = 0.0
+
+#         # register as buffers so they move to the right device/dtype with the module
+#         self.register_buffer("freq_x", freq_x)  # (half_dim,)
+#         self.register_buffer("freq_y", freq_y)  # (half_dim,)
+
+#         # different freq for different heads, fast forward position as theta = 1000000, much bigger than seq_len
+#         self.head_freq = torch.linspace(1, max_head_freq, 8) # 8 groups for key,value
+
+#     @torch.no_grad()
+#     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+#     def forward(self, x, position_ids):
+#         rows, cols = position_ids # (seq_len)
+#         rows = rows[None, :, None].float() # (1, seq_len, 1)
+#         cols = cols[None, :, None].float() # (1, seq_len, 1)
+#         device_type = x.device.type
+#         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+#             freq_x = self.freq_x.float()[None, None, :].to(x.device) # (1, 1, half_dim)
+#             freq_y = self.freq_y.float()[None, None, :].to(x.device) # (1, 1, half_dim)
+#             angles = rows * freq_x + cols * freq_y # (1, seq_len, half_dim)
+#             emb = torch.cat((angles, angles), dim=-1)[:, None] # (1, 1, seq_len, hidden_dim)
+#             emb = self.head_freq[None,:, None, None].to(x.device) * emb # (1, heads, seq_len, hidden_dim)
+#             cos = emb.cos() * self.attention_scaling # (1, 8, seq_len, hidden_dim) for key, value
+#             sin = emb.sin() * self.attention_scaling
+#             cos_expanded = cos.repeat_interleave(4, dim=1)  # → (1,32,seq_len,dim) for query
+#             sin_expanded = sin.repeat_interleave(4, dim=1)  # → (1,32,seq_len,dim)
+#         return cos_expanded.to(dtype=x.dtype), sin_expanded.to(dtype=x.dtype), cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    
 def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
     model, _ = FastModel.from_pretrained(model_name = model_name,
                                          max_seq_length = max_seq_length,
@@ -747,7 +821,6 @@ def shrink_grid_n_times(enlarged_grid, n, m):
         original_grid.append(original_row)
     return original_grid
 
-
 def generateTransformPara(n, apply_to_output=False):
     """Randomly generates transformation parameters"""
     # n is the number of examples
@@ -756,7 +829,6 @@ def generateTransformPara(n, apply_to_output=False):
                          np.random.permutation(n),\
                         #  (np.random.randint(1, 3), np.random.randint(1, 3)),\
                         1 if apply_to_output else np.random.randint(0, 2))
-
 
 def forward(x, tpara:TransformPara):
     """Applies transformations to a single grid."""
@@ -820,7 +892,7 @@ def find_first_exceed(task, max_len, extra_tokens=4):
             return i
     return len(task)  # If total never exceeds max_len
 
-def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False):
+def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False, offset1: int = 0, offset2: int = 0):
     """
     Tokenizes a task for causal (autoregressive) training or inference,
     optionally providing 2D positional indices using optimized list extensions.
@@ -871,6 +943,10 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
     else:
         task = task[:n_task]
     n = len(task)
+    if offset2 == 0:
+        global_r, global_c = 1, 1
+    else:
+        global_r, global_c = offset2, offset2 # special token has (0,0). So we start from offset2 to differentiate special token.
     for i, (x, y) in enumerate(task):
         IsLast = (i == n-1) and IsDecode
         
@@ -893,8 +969,8 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
                 target_tokens.extend([PAD_TOKEN]*len(row))
             if NeedPosition:
                 row_len = len(row)
-                row_indices.extend([r_idx + 1] * row_len)
-                col_indices.extend(list(range(1, row_len + 1)))
+                row_indices.extend([r_idx + global_r] * row_len)
+                col_indices.extend(list(range(global_c, row_len + global_c)))
 
             input_tokens.append(LINE_BREAK)
             if NeedPosition:
@@ -915,7 +991,10 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
             output_start_pos = len(input_tokens)
             input_length = output_start_pos - input_start_pos
             lengths.append(input_length)
-            
+
+        # separate out input and output grid    
+        global_r += offset1
+        global_c += offset1
 
         # Process output grid (y)
         input_tokens.append(BOS_Y)
@@ -934,8 +1013,8 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
                 if NeedPosition:
                     # Extend position indices for the row
                     row_len = len(row)
-                    row_indices.extend([r_idx + 1] * row_len)
-                    col_indices.extend(list(range(1, row_len + 1)))
+                    row_indices.extend([r_idx + global_r] * row_len)
+                    col_indices.extend(list(range(global_c, row_len + global_c)))
 
                 input_tokens.append(LINE_BREAK)
                 if NeedPosition:
@@ -955,6 +1034,10 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
             if ReturnLengths:
                 output_length = len(input_tokens) - output_start_pos
                 lengths.append(output_length)
+            
+            # separate out different examples
+            global_r += offset2
+            global_c += offset2
         else:
             target_tokens = y  # For the last example in decode mode, we don't add output length
         
@@ -1231,8 +1314,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-
-def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True, apply_to_output=False):
+def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True, apply_to_output=False, offset1=0, offset2=0):
     """Generate data for training or testing.
     
     Args:
@@ -1261,10 +1343,9 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
         if IsTrain:
             # TODO: tansformation for decode
             task = forwardTask(task, generateTransformPara(len(task), apply_to_output=apply_to_output))
-            task = forwardTask(task, generateTransformPara(len(task), apply_to_output=apply_to_output))
         
         # Tokenize the task
-        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition, ReturnLengths=ReturnLengths)
+        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition, ReturnLengths=ReturnLengths, offset1=offset1, offset2=offset2)
         yield out
 
 def create_attention_mask(length: int) -> torch.Tensor:
@@ -2134,45 +2215,4 @@ def plot_attention_patterns(pattern, layers=0, num_heads=32, rows=4, cols=8, fig
     plt.tight_layout()
     plt.suptitle(title, fontsize=16)
     plt.subplots_adjust(top=0.92)
-    
-    return fig
-
-import matplotlib.pyplot as plt
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-
-def plot_attention_patterns(pattern, layers=0, num_heads=32, rows=4, cols=8, figsize=(20, 10), title='Attention Patterns for Different Heads'):
-    """
-    Plot attention patterns for different heads.
-    
-    Args:
-        pattern: Tensor containing attention patterns for different heads
-        num_heads: Number of attention heads to plot
-        rows: Number of rows in the subplot grid
-        cols: Number of columns in the subplot grid
-        figsize: Figure size as (width, height)
-        title: Title for the overall figure
-    """
-    pattern = pattern[layers]
-    # Create a figure with subplots for different heads
-    fig, axes = plt.subplots(rows, cols, figsize=figsize)
-    axes = axes.flatten()
-
-    # Plot each head's pattern
-    for h in range(num_heads):
-        ax = axes[h]
-        im = ax.imshow(pattern[h].detach().cpu().numpy(), cmap='viridis')
-        ax.set_title(f'Head {h}')
-        ax.set_xlabel('Width')
-        ax.set_ylabel('Height')
-        
-        # Add colorbar for each subplot
-        divider = make_axes_locatable(ax)
-        cax = divider.append_axes("right", size="5%", pad=0.05)
-        plt.colorbar(im, cax=cax)
-
-    # Adjust layout
-    plt.tight_layout()
-    plt.suptitle(title, fontsize=16)
-    plt.subplots_adjust(top=0.92)
-    
     return fig
