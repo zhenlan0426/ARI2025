@@ -48,8 +48,8 @@ Problem: To solve ARC AGI problem using VLM. each task is represented as (input1
          return k_out[:, :, :cache_position[-1].item()+1], v_out[:, :, :cache_position[-1].item()+1]
          ```
 #### Relative Position Bias
-6. 4d position based attention mask. _update_causal_mask will ingore 4d attention mask passed in.
-   - Modify /home/zhenlan/anaconda3/lib/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py (line 546)
+6. 4d position based additive attention score. _update_causal_mask will ingore 4d attention mask passed in.
+   - disable _update_causal_mask in /home/zhenlan/anaconda3/lib/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py (line 546)
       ```python
          # causal_mask = self._update_causal_mask(
          #     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
@@ -72,8 +72,48 @@ Problem: To solve ARC AGI problem using VLM. each task is represented as (input1
                                                    )
       ```
       attention_mask is of shape (layers, heads, seq_len, seq_len) from MultiGridAttention. only works when batch size is 1
-- Tried seperate parameter for different layers or same parameter for all layers. No difference in performance. **grad is really small (1e-8)**. model performance is worse when RoPE is disabled (due to difference from pretrain?)
+- Tried seperate parameter for different layers or same parameter for all layers. No difference in performance. **grad is really small (1e-8)**. model performance is worse when RoPE is disabled (due to difference from pretrain?) - **Fine_Tune copy 12**
 - Implement custom backward pass for relative position bias (MultiGridAttention2) for better VRAM management.
 - Future work: 
    - test without RoPE and disable input only transformation to ease learning.
    - parametrize attention score with MLP(relative row and col) -> bias
+#### 2d RoPE
+- introduce Qwen3RotaryEmbedding2d and rows, cols position embedding (Fine_Tune copy 14)
+- Qwen3RotaryEmbedding2d features different frequencies for different heads. need to have cos.repeat_interleave due to 32 heads for query but only 8 for key,value.
+- apply_rotary_pos_emb needs to be modified to use cos_expanded and sin_expanded for query, cos and sin for key.
+- tokenize_causal introduces offset1 and offset2 for model to tell the difference between input and output of same example and between different examples.
+- take longer to train with worse performance. Most likely due to different rotation from pretrain domain.
+- trainable head_freq is not working as pytorch complains about backward pass for a second time. Most likely due to cos and sin are shared across layers.
+```python
+class Qwen3RotaryEmbedding2d(nn.Module):
+    def __init__(self, config: Qwen3Config, max_head_freq=100, device=None):
+        super().__init__()
+        ...
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        mask = torch.arange(len(inv_freq)) % 2 == 0
+        freq_x = inv_freq.clone()
+        freq_y = inv_freq.clone()
+        freq_x[~mask] = 0.0
+        freq_y[mask] = 0.0
+        # different freq for different heads, fast forward position as theta = 1000000, much bigger than seq_len
+        self.head_freq = torch.linspace(1, max_head_freq, 8) # 8 groups for key,value
+
+    @torch.no_grad()
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    def forward(self, x, position_ids):
+        rows, cols = position_ids # (seq_len)
+        rows = rows[None, :, None].float() # (1, seq_len, 1)
+        cols = cols[None, :, None].float() # (1, seq_len, 1)
+        device_type = x.device.type
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freq_x = self.freq_x.float()[None, None, :].to(x.device) # (1, 1, half_dim)
+            freq_y = self.freq_y.float()[None, None, :].to(x.device) # (1, 1, half_dim)
+            angles = rows * freq_x + cols * freq_y # (1, seq_len, half_dim)
+            emb = torch.cat((angles, angles), dim=-1)[:, None] # (1, 1, seq_len, hidden_dim)
+            emb = self.head_freq[None,:, None, None].to(x.device) * emb # (1, heads, seq_len, hidden_dim)
+            cos = emb.cos() * self.attention_scaling # (1, 8, seq_len, hidden_dim) for key, value
+            sin = emb.sin() * self.attention_scaling
+            cos_expanded = cos.repeat_interleave(4, dim=1)  # → (1,32,seq_len,dim) for query
+            sin_expanded = sin.repeat_interleave(4, dim=1)  # → (1,32,seq_len,dim)
+        return cos_expanded.to(dtype=x.dtype), sin_expanded.to(dtype=x.dtype), cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+```
