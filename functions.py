@@ -4,6 +4,8 @@ import numpy as np
 import random
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from transformers import StaticCache
 from typing import List, Tuple, Optional
 import gc
@@ -80,6 +82,24 @@ class GlobalConfig:
             data = json.load(json_file)
         return cls(**data)
 
+class FeatureEmbedding(nn.Module):
+    def __init__(self, embed_model, config, input_dim=94, output_dim=74):
+        super().__init__()
+        self.embed_model = embed_model
+        self.config = config
+        d = config.hidden_size
+        self.input_features_MLP = torch.nn.Sequential(torch.nn.Linear(input_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d)).to('cuda')
+        self.output_features_MLP = torch.nn.Sequential(torch.nn.Linear(output_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d)).to('cuda')
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, input_features, output_features, input_tokens):
+        input_features = self.input_features_MLP(input_features)
+        output_features = self.output_features_MLP(output_features)
+        embed_features = self.embed_model(input_tokens)
+        embed_features = embed_features.masked_scatter((input_tokens==6)[...,None], input_features)
+        embed_features = embed_features.masked_scatter((input_tokens==7)[...,None], output_features)
+        embed_features = self.norm(embed_features)
+        return embed_features
 
 class PositionalEmbedding2D(nn.Module):
     """
@@ -875,9 +895,12 @@ def backwardTask(task, tpara):
     pass
 
 '''  ----------------------------------- Tokenization utilities ------------------------------------- '''
-def numpy2torch(x):
+def numpy2torch(x, dtype=None):
     """Convert numpy array to torch tensor and move to GPU"""
-    x = torch.tensor(x)[None].to('cuda')
+    if dtype is None:
+        x = torch.tensor(x)[None].to('cuda')
+    else:
+        x = torch.tensor(x, dtype=dtype)[None].to('cuda')
     return x
 
 def find_first_exceed(task, max_len, extra_tokens=4):
@@ -947,7 +970,7 @@ def tokenize_features(task, max_length, IsDecode=False, max_k=5):
         target_tokens.extend(target)
     input_features = np.concatenate(input_features, axis=0)
     output_features = np.concatenate(output_features, axis=0)
-    return {"input_tokens": numpy2torch(input_tokens), "target_tokens": numpy2torch(target_tokens), "input_features": numpy2torch(input_features), "output_features": numpy2torch(output_features)}
+    return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(input_features, dtype=torch.bfloat16), torch.tensor(output_features, dtype=torch.bfloat16)
     
 
 def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False, offset1: int = 0, offset2: int = 0):
@@ -1372,7 +1395,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, tokenize_func, **kwargs):
+def data_gen(data, IsTrain, tokenize_func, apply_to_output=False, **kwargs):
     """Generate data for training or testing.
     
     Args:
@@ -1406,6 +1429,24 @@ def data_gen(data, IsTrain, tokenize_func, **kwargs):
         out = tokenize_func(task, **kwargs)
         yield out
 
+class CustomDataset(Dataset):    
+    def __init__(self, data, IsTrain, tokenize_func, apply_to_output=False, **kwargs):
+        self.data_source = data['train'] if IsTrain else data['test']
+        self.is_train = IsTrain
+        self.tokenize_func = tokenize_func
+        self.apply_to_output = apply_to_output
+        self.kwargs = kwargs
+        
+    def __len__(self):
+        return len(self.data_source)
+    
+    def __getitem__(self, idx):
+        task = self.data_source[idx]
+        if self.is_train:
+            task = forwardTask(task, generateTransformPara(len(task), apply_to_output=self.apply_to_output))
+        out = self.tokenize_func(task, **self.kwargs)
+        return out
+    
 def create_attention_mask(length: int) -> torch.Tensor:
   mask = torch.zeros(length, length, dtype=torch.bfloat16, device='cuda')
   is_upper_triangle = torch.triu(torch.ones(length, length, dtype=torch.bool, device='cuda'), diagonal=1)
