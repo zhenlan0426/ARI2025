@@ -1,15 +1,16 @@
 import numpy as np
-from typing import List, Tuple
-import copy
+from typing import List, Tuple, Optional
 
-def extract_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
+
+def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
     """
     Extract features from a grid of integers (0-9).
-    Optimized version that precomputes color counts.
+    For k-dependent features, iterates over k = 3, 5, 7, ... max_k and concatenates results.
+    For k-independent features, computes them once.
     
     Args:
         grid: List of lists of integers between 0 and 9
-        k: Size of the box for local features (default: 3)
+        max_k: Maximum size of the box for local features (default: 3)
     
     Returns:
         A numpy array of shape (n_pixels, n_features) containing the features for each pixel
@@ -35,23 +36,48 @@ def extract_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
             # Get the center pixel color
             center_color = grid_array[i, j]
             
-            # Define the k x k box around the center pixel
-            box_start_i = max(0, i - k // 2)
-            box_end_i = min(height, i + k // 2 + 1)
-            box_start_j = max(0, j - k // 2)
-            box_end_j = min(width, j + k // 2 + 1)
+            # K-dependent features: iterate over k values
+            k_values = range(3, max_k + 1, 2)  # 3, 5, 7, ..., max_k
+            for k in k_values:
+                # Define the k x k box around the center pixel
+                box_start_i = max(0, i - k // 2)
+                box_end_i = min(height, i + k // 2 + 1)
+                box_start_j = max(0, j - k // 2)
+                box_end_j = min(width, j + k // 2 + 1)
+                
+                box = grid_array[box_start_i:box_end_i, box_start_j:box_end_j]
+                box_size = box.shape[0] * box.shape[1]
+                
+                # 1. Count of each color in the k x k box (normalized)
+                for color in range(10):
+                    count = np.sum(box == color)
+                    pixel_features.append(count / box_size)
+                
+                # 2. Count of color in the box that is the same as the center pixel (normalized)
+                same_color_count = np.sum(box == center_color)
+                pixel_features.append(same_color_count / box_size)
+                
+                # 5. Count of connected cells (4-ways and 8-ways) in k x k box
+                connected_4way = count_connected_cells(grid_array, i, j, k, diagonal=False)
+                connected_8way = count_connected_cells(grid_array, i, j, k, diagonal=True)
+                pixel_features.append(connected_4way / box_size)
+                pixel_features.append(connected_8way / box_size)
+                
+                # 10. Symmetry features for k x k box
+                h_sym = is_horizontally_symmetric(box)
+                v_sym = is_vertically_symmetric(box)
+                r_sym = is_rotationally_symmetric(box)
+                pixel_features.append(float(h_sym))
+                pixel_features.append(float(v_sym))
+                pixel_features.append(float(r_sym))
+                
+                # 12. Edge detection in k x k box
+                h_edge = has_horizontal_edge(box)
+                v_edge = has_vertical_edge(box)
+                pixel_features.extend(h_edge)
+                pixel_features.extend(v_edge)
             
-            box = grid_array[box_start_i:box_end_i, box_start_j:box_end_j]
-            box_size = box.shape[0] * box.shape[1]
-            
-            # 1. Count of each color in the k x k box (normalized)
-            for color in range(10):
-                count = np.sum(box == color)
-                pixel_features.append(count / box_size)
-            
-            # 2. Count of color in the box that is the same as the center pixel (normalized)
-            same_color_count = np.sum(box == center_color)
-            pixel_features.append(same_color_count / box_size)
+            # K-independent features (computed once)
             
             # 3. Row and Column Indices normalized
             pixel_features.append(i / 30)
@@ -60,12 +86,6 @@ def extract_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
             # 4. One-hot encoding of the center pixel color
             for color in range(10):
                 pixel_features.append(1.0 if center_color == color else 0.0)
-            
-            # 5. Count of connected cells (4-ways and 8-ways) in k x k box
-            connected_4way = count_connected_cells(grid_array, i, j, k, diagonal=False)
-            connected_8way = count_connected_cells(grid_array, i, j, k, diagonal=True)
-            pixel_features.append(connected_4way / box_size)
-            pixel_features.append(connected_8way / box_size)
             
             # 6. Count of connected cells (4-ways and 8-ways) in the whole grid
             connected_4way_grid = count_connected_cells(grid_array, i, j, max(height, width), diagonal=False)
@@ -92,23 +112,9 @@ def extract_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
             for color in range(10):
                 pixel_features.append(grid_color_counts[color] / grid_total_pixels)
             
-            # 10. Symmetry features for k x k box
-            h_sym = is_horizontally_symmetric(box)
-            v_sym = is_vertically_symmetric(box)
-            r_sym = is_rotationally_symmetric(box)
-            pixel_features.append(float(h_sym))
-            pixel_features.append(float(v_sym))
-            pixel_features.append(float(r_sym))
-            
             # 11. Height and width of input grid (normalized)
             pixel_features.append(height / 30)
             pixel_features.append(width / 30)
-            
-            # 12. Edge detection in k x k box
-            h_edge = has_horizontal_edge(box)
-            v_edge = has_vertical_edge(box)
-            pixel_features.append(float(h_edge))
-            pixel_features.append(float(v_edge))
             
             # 13. Count of contiguous same color in diagonals
             diag_count = count_diagonal(grid_array, i, j, center_color) / 30
@@ -136,15 +142,16 @@ def extract_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
     
     return np.array(features)
 
-def extract_causal_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
+def extract_causal_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
     """
     Extract features from a grid with causality constraint.
     Cell i,j can only depend on current row i with smaller or equal j and all previous rows.
-    Optimized version that precomputes color counts.
+    For k-dependent features, iterates over k = 3, 5, 7, ... max_k and concatenates results.
+    For k-independent features, computes them once.
     
     Args:
         grid: List of lists of integers between 0 and 9
-        k: Size of the box for local features (default: 3)
+        max_k: Maximum size of the box for local features (default: 3)
     
     Returns:
         A numpy array of shape (n_pixels, n_features) containing the features for each pixel
@@ -175,34 +182,47 @@ def extract_causal_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
                 causal_grid_color_counts[color] = np.sum((grid_array == color) & causal_mask)
             causal_grid_total_pixels = np.sum(causal_mask)
             
-            # Define the k x k box around the center pixel (causal part only)
-            box_start_i = max(0, i - k // 2)
-            box_end_i = min(height, i + k // 2 + 1)
-            box_start_j = max(0, j - k // 2)
-            box_end_j = min(width, j + k // 2 + 1)
-            
-            # Get box and apply causal mask
-            box = grid_array[box_start_i:box_end_i, box_start_j:box_end_j]
-            box_mask = causal_mask[box_start_i:box_end_i, box_start_j:box_end_j]
-            box_size = np.sum(box_mask)  # Count of valid pixels in the box
-            
-            # Skip features that cannot be implemented causally
-            
-            # 1. Count of each color in the causally visible part of k x k box
-            for color in range(10):
+            # K-dependent features: iterate over k values
+            k_values = range(3, max_k + 1, 2)  # 3, 5, 7, ..., max_k
+            for k in k_values:
+                # Define the k x k box around the center pixel (causal part only)
+                box_start_i = max(0, i - k // 2)
+                box_end_i = min(height, i + k // 2 + 1)
+                box_start_j = max(0, j - k // 2)
+                box_end_j = min(width, j + k // 2 + 1)
+                
+                # Get box and apply causal mask
+                box = grid_array[box_start_i:box_end_i, box_start_j:box_end_j]
+                box_mask = causal_mask[box_start_i:box_end_i, box_start_j:box_end_j]
+                box_size = np.sum(box_mask)  # Count of valid pixels in the box
+                
+                # 1. Count of each color in the causally visible part of k x k box
+                for color in range(10):
+                    if box_size > 0:
+                        count = np.sum((box == color) & box_mask)
+                        pixel_features.append(count / box_size)
+                    else:
+                        pixel_features.append(0.0)
+                
+                # 2. Count of color in the box that is the same as the center pixel (normalized)
                 if box_size > 0:
-                    count = np.sum((box == color) & box_mask)
-                    pixel_features.append(count / box_size)
+                    same_color_count = np.sum((box == center_color) & box_mask)
+                    pixel_features.append(same_color_count / box_size)
                 else:
                     pixel_features.append(0.0)
-            
-            # 2. Count of color in the box that is the same as the center pixel (normalized)
-            if box_size > 0:
-                same_color_count = np.sum((box == center_color) & box_mask)
-                pixel_features.append(same_color_count / box_size)
-            else:
-                pixel_features.append(0.0)
                 
+                # 5. Count of connected cells (4-ways and 8-ways) in causally visible k x k box
+                connected_4way = count_connected_cells_causal(grid_array, i, j, k, causal_mask, diagonal=False)
+                connected_8way = count_connected_cells_causal(grid_array, i, j, k, causal_mask, diagonal=True)
+                if box_size > 0:
+                    pixel_features.append(connected_4way / box_size)
+                    pixel_features.append(connected_8way / box_size)
+                else:
+                    pixel_features.append(0.0)
+                    pixel_features.append(0.0)
+            
+            # K-independent features (computed once)
+            
             # 3. Row and Column Indices normalized
             pixel_features.append(i / 30)
             pixel_features.append(j / 30)
@@ -210,16 +230,6 @@ def extract_causal_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
             # 4. One-hot encoding of the center pixel color
             for color in range(10):
                 pixel_features.append(1.0 if center_color == color else 0.0)
-            
-            # 5. Count of connected cells (4-ways and 8-ways) in causally visible k x k box
-            connected_4way = count_connected_cells_causal(grid_array, i, j, k, causal_mask, diagonal=False)
-            connected_8way = count_connected_cells_causal(grid_array, i, j, k, causal_mask, diagonal=True)
-            if box_size > 0:
-                pixel_features.append(connected_4way / box_size)
-                pixel_features.append(connected_8way / box_size)
-            else:
-                pixel_features.append(0.0)
-                pixel_features.append(0.0)
             
             # 6. Count of connected cells in the causal part of the whole grid
             connected_4way_grid = count_connected_cells_causal(grid_array, i, j, max(height, width), causal_mask, diagonal=False)
@@ -267,16 +277,6 @@ def extract_causal_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
                 else:
                     pixel_features.append(0.0)
             
-            # Skip symmetry features (10) as they don't have causal counterparts
-            
-            # 11. skip height and width features as they are not causal
-            # pixel_features.append(height / 30)
-            # pixel_features.append(width / 30)
-            
-            # Skip edge detection (12) as it doesn't have a causal counterpart
-            
-            # Skip diagonal features (13) as they don't have clear causal counterparts
-            
             # 14. Is the cell on the grid border
             is_border = (i == 0 or j == 0)  # Only top and left borders are causal
             pixel_features.append(float(is_border))
@@ -284,8 +284,6 @@ def extract_causal_features(grid: List[List[int]], k: int = 3) -> np.ndarray:
             # 15. Is the cell in a corner of the grid
             is_corner = (i == 0 and j == 0)  # Only top-left corner is causal
             pixel_features.append(float(is_corner))
-            
-            # Skip bounding box feature (16) as it doesn't have a causal counterpart
             
             features.append(pixel_features)
     
@@ -386,11 +384,91 @@ def is_vertically_symmetric(box: np.ndarray) -> bool:
 def is_rotationally_symmetric(box: np.ndarray) -> bool: # 180 degrees
     return np.array_equal(box, np.rot90(box, 2))
 
-def has_horizontal_edge(box: np.ndarray) -> bool:
-    return np.any(box[:-1, :] != box[1:, :])
+def _is_uniform_and_get_color(arr: np.ndarray) -> Tuple[bool, Optional[int]]:
+    """
+    Checks if a 1D array is uniform in color and returns the color if so.
+    An empty array is not considered uniform for this purpose.
+    """
+    if arr.size == 0:
+        return False, None 
+    unique_colors = np.unique(arr)
+    if len(unique_colors) == 1:
+        return True, unique_colors[0]
+    return False, None
 
-def has_vertical_edge(box: np.ndarray) -> bool:
-    return np.any(box[:, :-1] != box[:, 1:])
+def has_vertical_edge(box: np.ndarray) -> Tuple[float, float]:
+    """
+    Checks for a vertical edge in a box as per Feature 12.
+    - Center column is uniformly one color.
+    - Left column is uniformly another color (different from center),
+    - Right column is uniformly another color (different from center).
+    """
+    _box_rows, box_cols = box.shape
+    
+    # Needs at least 3 columns for a center and at least one side column.
+    if box_cols < 3: 
+        return 0.0, 0.0
+
+    center_c_idx = box_cols // 2 
+
+    is_center_uniform, color_center = _is_uniform_and_get_color(box[:, center_c_idx])
+    if not is_center_uniform:
+        return 0.0, 0.0
+
+    # Check with right column
+    # The column index for right is center_c_idx + 1
+    is_right_uniform, color_right = _is_uniform_and_get_color(box[:, center_c_idx + 1])
+    if is_right_uniform and color_right != color_center:
+        res0 = 1.0
+    else:
+        res0 = 0.0
+
+    # Check with left column
+    # The column index for left is center_c_idx - 1
+    is_left_uniform, color_left = _is_uniform_and_get_color(box[:, center_c_idx - 1])
+    if is_left_uniform and color_left != color_center:
+        res1 = 1.0
+    else:
+        res1 = 0.0
+            
+    return res0, res1
+
+def has_horizontal_edge(box: np.ndarray) -> Tuple[float, float]:
+    """
+    Checks for a horizontal edge in a box as per Feature 12.
+    - Center row is uniformly one color.
+    - EITHER Top row is uniformly another color (different from center)
+    - OR Bottom row is uniformly another color (different from center).
+    """
+    box_rows, _box_cols = box.shape
+
+    # Needs at least 3 rows for a center and at least one side row.
+    if box_rows < 3:
+        return 0.0, 0.0
+
+    center_r_idx = box_rows // 2
+
+    is_center_uniform, color_center = _is_uniform_and_get_color(box[center_r_idx, :])
+    if not is_center_uniform:
+        return 0.0, 0.0
+
+    # Check with bottom row
+    # The row index for bottom is center_r_idx + 1
+    is_bottom_uniform, color_bottom = _is_uniform_and_get_color(box[center_r_idx + 1, :])
+    if is_bottom_uniform and color_bottom != color_center:
+        res0 = 1.0
+    else:
+        res0 = 0.0
+    
+    # Check with top row
+    # The row index for top is center_r_idx - 1
+    is_top_uniform, color_top = _is_uniform_and_get_color(box[center_r_idx - 1, :])
+    if is_top_uniform and color_top != color_center:
+        res1 = 1.0
+    else:
+        res1 = 0.0
+            
+    return res0, res1
 
 def count_diagonal(grid, center_i, center_j, color):
     """Count contiguous same color in the main diagonal."""
@@ -459,23 +537,27 @@ def has_bounding_box(grid, center_i, center_j, distance):
     
     return True
 
-def test_causality_constraint(grid, k=3):
+def test_causality_constraint(grid, max_k: int = 5):
     """
     Tests that modifying grid[i,j] only causes differences in features
     with row-column order >= (i,j) (flatten index >= i*width + j).
     """
     grid = np.array(grid)
     h, w = grid.shape
-    orig_features = extract_causal_features(grid.tolist(), k=k)
-    
+    orig_features = extract_causal_features(grid.tolist(), max_k=max_k)
+    tot = h * w
+    idx = 0
     for i in range(h):
         for j in range(w):
             modified_grid = grid.copy()
             # Flip the value in a deterministic way (must be different from original)
             modified_grid[i, j] = (grid[i, j] + 1) % 10
 
-            new_features = extract_causal_features(modified_grid.tolist(), k=k)
+            new_features = extract_causal_features(modified_grid.tolist(), max_k=max_k)
 
             # Compare
             diff_locs = np.where(np.any(orig_features != new_features, axis=1))[0]
-            print(diff_locs)
+            if np.any(diff_locs != np.arange(idx, tot)):
+                raise ValueError(f"Causality constraint violated at {i}, {j}")
+            idx += 1
+
