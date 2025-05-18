@@ -892,6 +892,64 @@ def find_first_exceed(task, max_len, extra_tokens=4):
             return i
     return len(task)  # If total never exceeds max_len
 
+from features_optimized import extract_features, extract_causal_features
+def tokenize_features(task, max_length, IsDecode=False, max_k=5):
+    BOS_X = 10  # Beginning of input grid
+    EOS_X = 11  # End of input grid
+    LINE_BREAK = 12  # Row separator
+    BOS_Y = 13  # Beginning of output grid
+    EOS_Y = 14  # End of output grid
+    INPUT_PLACEHOLDER = 6
+    OUTPUT_PLACEHOLDER = 7
+    PAD_TOKEN = -100  # Padding/ignored token
+
+    input_tokens = []
+    target_tokens = []
+    input_features = []
+    output_features = []
+    n_task = find_first_exceed(task, max_length)
+    def get_token_from_grid(grid, bos_token, eos_token, placeholder_token, line_break_token, IsOutput):
+        tokens = [bos_token]
+        targets = [PAD_TOKEN]
+        line = [placeholder_token] * len(grid[0])
+        line.append(line_break_token)
+        for row in grid:
+            tokens.extend(line)
+            if IsOutput:
+                targets.extend(row)
+                targets.append(line_break_token)
+        tokens.append(eos_token)
+        if IsOutput:
+            targets.append(eos_token)
+            targets = targets[1:]
+            targets.append(PAD_TOKEN)
+        else:
+            targets = [PAD_TOKEN] * len(tokens)
+        assert len(tokens) == len(targets), f"token length and target length mismatch, tokens: {len(tokens)}, targets: {len(targets)}"
+        return tokens, targets
+    if IsDecode:
+        # For decoding, must include the last task
+        task = task[:n_task-1] + [task[-1]] 
+    else:
+        task = task[:n_task]
+    for x, y in task:
+        # Extract features
+        input_feature = extract_features(x, max_k=max_k) # (l, d)
+        output_feature = extract_causal_features(y, max_k=max_k)
+        input_features.append(input_feature)
+        output_features.append(output_feature)
+        # Tokenize input and targets
+        token, target = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK, False)
+        input_tokens.extend(token)
+        target_tokens.extend(target)
+        token, target = get_token_from_grid(y, BOS_Y, EOS_Y, OUTPUT_PLACEHOLDER, LINE_BREAK, True)
+        input_tokens.extend(token)
+        target_tokens.extend(target)
+    input_features = np.concatenate(input_features, axis=0)
+    output_features = np.concatenate(output_features, axis=0)
+    return {"input_tokens": numpy2torch(input_tokens), "target_tokens": numpy2torch(target_tokens), "input_features": numpy2torch(input_features), "output_features": numpy2torch(output_features)}
+    
+
 def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False, offset1: int = 0, offset2: int = 0):
     """
     Tokenizes a task for causal (autoregressive) training or inference,
@@ -1314,7 +1372,7 @@ def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
     else:
         return {"input_tokens":numpy2torch(input_tokens), "target_tokens":numpy2torch(target_tokens) if target_tokens is not None else None, "len_input":len_input}
 
-def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_func=tokenize_causal, IsDecode=False, ReturnLengths=True, apply_to_output=False, offset1=0, offset2=0):
+def data_gen(data, IsTrain, tokenize_func, **kwargs):
     """Generate data for training or testing.
     
     Args:
@@ -1345,7 +1403,7 @@ def data_gen(data, IsTrain, max_length, autoregressive, NeedPosition, tokenize_f
             task = forwardTask(task, generateTransformPara(len(task), apply_to_output=apply_to_output))
         
         # Tokenize the task
-        out = tokenize_func(task, autoregressive=autoregressive, IsDecode=IsDecode, max_length=max_length, NeedPosition=NeedPosition, ReturnLengths=ReturnLengths, offset1=offset1, offset2=offset2)
+        out = tokenize_func(task, **kwargs)
         yield out
 
 def create_attention_mask(length: int) -> torch.Tensor:
