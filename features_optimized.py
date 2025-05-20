@@ -2,7 +2,7 @@ import numpy as np
 from typing import List, Tuple, Optional
 
 
-def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
+def extract_features(grid: List[List[int]], background_color, max_k: int = 5) -> np.ndarray:
     """
     Extract features from a grid of integers (0-9).
     For k-dependent features, iterates over k = 3, 5, 7, ... max_k and concatenates results.
@@ -24,7 +24,22 @@ def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
     for color in range(10):
         grid_color_counts[color] = np.sum(grid_array == color)
     grid_total_pixels = height * width
+
+    # Precompute connected components for the entire grid for each color
+    # Store both 4-way and 8-way connectivity
+    connected_labels_4way = {}  # Dictionary to store labeled arrays for each color (4-way)
+    connected_labels_8way = {}  # Dictionary to store labeled arrays for each color (8-way)
     
+    structure_4way = np.array([[0,1,0],
+                               [1,1,1],
+                               [0,1,0]], dtype=bool)
+    structure_8way = np.ones((3,3), dtype=bool)
+    
+    for color in range(10):
+        color_mask = (grid_array == color)
+        connected_labels_4way[color], _ = label(color_mask, structure=structure_4way)
+        connected_labels_8way[color], _ = label(color_mask, structure=structure_8way)
+            
     # Create a matrix to store all features for all pixels
     features = []
     
@@ -35,7 +50,7 @@ def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
             
             # Get the center pixel color
             center_color = grid_array[i, j]
-            
+            offset = center_color - 10
             # K-dependent features: iterate over k values
             k_values = range(3, max_k + 1, 2)  # 3, 5, 7, ..., max_k
             for k in k_values:
@@ -54,12 +69,21 @@ def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
                     pixel_features.append(count / box_size)
                 
                 # 2. Count of color in the box that is the same as the center pixel (normalized)
-                same_color_count = np.sum(box == center_color)
-                pixel_features.append(same_color_count / box_size)
+                pixel_features.append(pixel_features[offset])
                 
                 # 5. Count of connected cells (4-ways and 8-ways) in k x k box
-                connected_4way = count_connected_cells(grid_array, i, j, k, diagonal=False)
-                connected_8way = count_connected_cells(grid_array, i, j, k, diagonal=True)
+                # Extract the relevant portion of the precomputed connected components
+                labels_4way = connected_labels_4way[center_color][box_start_i:box_end_i, box_start_j:box_end_j]
+                labels_8way = connected_labels_8way[center_color][box_start_i:box_end_i, box_start_j:box_end_j]
+                
+                # Find the label at the center position
+                center_label_4way = connected_labels_4way[center_color][i, j]
+                center_label_8way = connected_labels_8way[center_color][i, j]
+                
+                # Count cells with the same label if the center has a non-zero label
+                connected_4way = np.sum(labels_4way == center_label_4way) if center_label_4way > 0 else 0
+                connected_8way = np.sum(labels_8way == center_label_8way) if center_label_8way > 0 else 0
+                
                 pixel_features.append(connected_4way / box_size)
                 pixel_features.append(connected_8way / box_size)
                 
@@ -76,6 +100,10 @@ def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
                 v_edge = has_vertical_edge(box)
                 pixel_features.extend(h_edge)
                 pixel_features.extend(v_edge)
+                
+                # 16. Is there a bounding square box of same color at distance k
+                has_bounding = has_bounding_box(grid_array, i, j, k // 2)
+                pixel_features.append(float(has_bounding))
             
             # K-independent features (computed once)
             
@@ -88,8 +116,13 @@ def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
                 pixel_features.append(1.0 if center_color == color else 0.0)
             
             # 6. Count of connected cells (4-ways and 8-ways) in the whole grid
-            connected_4way_grid = count_connected_cells(grid_array, i, j, max(height, width), diagonal=False)
-            connected_8way_grid = count_connected_cells(grid_array, i, j, max(height, width), diagonal=True)
+            # Use the precomputed connected components for the entire grid
+            grid_label_4way = connected_labels_4way[center_color][i, j]
+            grid_label_8way = connected_labels_8way[center_color][i, j]
+            
+            connected_4way_grid = np.sum(connected_labels_4way[center_color] == grid_label_4way) if grid_label_4way > 0 else 0
+            connected_8way_grid = np.sum(connected_labels_8way[center_color] == grid_label_8way) if grid_label_8way > 0 else 0
+            
             pixel_features.append(connected_4way_grid / grid_total_pixels)
             pixel_features.append(connected_8way_grid / grid_total_pixels)
             
@@ -132,11 +165,6 @@ def extract_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
                         (i == height - 1 and j == 0) or 
                         (i == height - 1 and j == width - 1))
             pixel_features.append(float(is_corner))
-            
-            # 16. Is there a bounding square box of same color at different k distances
-            for dist in range(1, min(4, min(height, width) // 2)):
-                has_bounding = has_bounding_box(grid_array, i, j, dist)
-                pixel_features.append(float(has_bounding))
             
             features.append(pixel_features)
     
@@ -511,31 +539,54 @@ def count_anti_diagonal(grid, center_i, center_j, color):
     return count
 
 def has_bounding_box(grid, center_i, center_j, distance):
-    """Check if there's a bounding box of the same color at given distance."""
-    height, width = grid.shape
-    color = grid[center_i, center_j]
-    
-    # Define the coordinates of the bounding box
+    nrows, ncols = grid.shape
+    height, width = nrows, ncols
     top = max(0, center_i - distance)
     bottom = min(height - 1, center_i + distance)
     left = max(0, center_j - distance)
     right = min(width - 1, center_j + distance)
     
-    # Check if the bounding box exists within the grid
-    if top >= bottom or left >= right:
-        return False
-    
-    # Check top and bottom edges
-    for j in range(left, right + 1):
-        if grid[top, j] != color or grid[bottom, j] != color:
+    # find the number to compare with
+    number = None
+    if center_i - distance >= 0:
+        if center_j - distance >= 0:
+            number = grid[center_i - distance, center_j - distance]
+        elif center_j + distance < ncols:
+            number = grid[center_i - distance, center_j + distance]
+    elif center_i + distance < nrows:
+        if center_j - distance >= 0:
+            number = grid[center_i + distance, center_j - distance]
+        elif center_j + distance < ncols:
+            number = grid[center_i + distance, center_j + distance]
+    if number is None: return False
+
+    # Top Side
+    row = center_i - distance
+    if row >= 0:
+        if grid[row, left] != number or np.unique(grid[row, left:right+1]).size > 1:
             return False
-    
-    # Check left and right edges
-    for i in range(top + 1, bottom):
-        if grid[i, left] != color or grid[i, right] != color:
+
+    # Bottom Side
+    row = center_i + distance
+    if row < nrows:
+        if grid[row, left] != number or np.unique(grid[row, left:right+1]).size > 1:
             return False
-    
-    return True
+
+    # Left Side
+    col = center_j - distance
+    if 0 <= col:
+        if grid[top, col] != number or np.unique(grid[top+1:bottom, col]).size > 1:
+            return False
+
+    # Right Side
+    col = center_j + distance
+    if col < ncols:
+        if grid[top, col] != number or np.unique(grid[top+1:bottom, col]).size > 1:
+            return False
+
+    return True  # At least one side within bounds and all valid were OK
+
+
 
 def test_causality_constraint(grid, max_k: int = 5):
     """
