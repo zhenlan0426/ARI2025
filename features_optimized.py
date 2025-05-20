@@ -1,6 +1,6 @@
 import numpy as np
 from typing import List, Tuple, Optional
-
+from scipy.ndimage import label
 
 def extract_features(grid: List[List[int]], background_color, max_k: int = 5) -> np.ndarray:
     """
@@ -20,10 +20,12 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
     grid_array = np.array(grid, dtype=int)
     height, width = grid_array.shape
     
-    # Precompute color counts for the entire grid
-    grid_color_counts = np.zeros(10)
-    for color in range(10):
-        grid_color_counts[color] = np.sum(grid_array == color)
+    # Precompute binary mask for each color for the entire grid
+    color_masks = [grid_array == color for color in range(10)]
+
+    # Precompute color counts for the entire grid using precomputed masks
+    grid_color_counts = np.array([np.sum(mask) for mask in color_masks], dtype=float)
+    most_common_color = np.argmax(grid_color_counts)
     grid_total_pixels = height * width
 
     # Precompute connected components for the entire grid for each color
@@ -82,9 +84,10 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
     for i in range(height):
         for j in range(width):
             pixel_features = []
-            
             # Get the center pixel color
             center_color = grid_array[i, j]
+            pixel_features.append(float(most_common_color==center_color))
+            pixel_features.append(float(background_color==center_color))
             offset = center_color - 10
             # K-dependent features: iterate over k values
             k_values = range(3, max_k + 1, 2)  # 3, 5, 7, ..., max_k
@@ -100,7 +103,7 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
                 
                 # 1. Count of each color in the k x k box (normalized)
                 for color in range(10):
-                    count = np.sum(box == color)
+                    count = np.sum(color_masks[color][box_start_i:box_end_i, box_start_j:box_end_j])
                     pixel_features.append(count / box_size)
                 
                 # 2. Count of color in the box that is the same as the center pixel (normalized)
@@ -138,8 +141,8 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
                     # Compute color counts for this component in the box
                     box_component_color_counts = np.zeros(10)
                     for color in range(10):
-                        color_mask = (box == color)
-                        box_component_color_counts[color] = np.sum(color_mask & box_component_mask)
+                        mask = color_masks[color][box_start_i:box_end_i, box_start_j:box_end_j] & box_component_mask
+                        box_component_color_counts[color] = np.sum(mask)
                     # Normalize
                     box_color_dist_4way = box_component_color_counts / grid_total_pixels
                 else:
@@ -153,8 +156,8 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
                     # Compute color counts for this component in the box
                     box_component_color_counts = np.zeros(10)
                     for color in range(10):
-                        color_mask = (box == color)
-                        box_component_color_counts[color] = np.sum(color_mask & box_component_mask)
+                        mask = color_masks[color][box_start_i:box_end_i, box_start_j:box_end_j] & box_component_mask
+                        box_component_color_counts[color] = np.sum(mask)
                     # Normalize
                     box_color_dist_8way = box_component_color_counts / grid_total_pixels
                 else:
@@ -172,6 +175,16 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
                 pixel_features.append(float(h_sym))
                 pixel_features.append(float(v_sym))
                 pixel_features.append(float(r_sym))
+                
+                # NEW: Non-background symmetry features for k x k box
+                # Create binary matrix where 1=non-background, 0=background
+                binary_box = (box != background_color).astype(int)
+                h_sym_non_bg = is_horizontally_symmetric(binary_box)
+                v_sym_non_bg = is_vertically_symmetric(binary_box)
+                r_sym_non_bg = is_rotationally_symmetric(binary_box)
+                pixel_features.append(float(h_sym_non_bg))
+                pixel_features.append(float(v_sym_non_bg))
+                pixel_features.append(float(r_sym_non_bg))
                 
                 # 12. Edge detection in k x k box
                 h_edge = has_horizontal_edge(box)
@@ -272,7 +285,7 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
     
     return np.array(features)
 
-def extract_causal_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray:
+def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_color: int = 0) -> np.ndarray:
     """
     Extract features from a grid with causality constraint.
     Cell i,j can only depend on current row i with smaller or equal j and all previous rows.
@@ -350,6 +363,28 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray
                 else:
                     pixel_features.append(0.0)
                     pixel_features.append(0.0)
+                
+                # NEW: Symmetry features for causally visible k x k box
+                # We need to handle masked areas carefully when checking symmetry
+                # Use the part that's visible in causal mask for symmetry analysis
+                masked_box = np.where(box_mask, box, -1)  # Use -1 for masked areas
+                
+                # Standard symmetry features
+                h_sym = is_horizontally_symmetric(masked_box)
+                v_sym = is_vertically_symmetric(masked_box)
+                r_sym = is_rotationally_symmetric(masked_box)
+                pixel_features.append(float(h_sym))
+                pixel_features.append(float(v_sym))
+                pixel_features.append(float(r_sym))
+                
+                # Non-background symmetry features
+                binary_box = np.where(box_mask, (box != background_color).astype(int), -1)
+                h_sym_non_bg = is_horizontally_symmetric(binary_box)
+                v_sym_non_bg = is_vertically_symmetric(binary_box)
+                r_sym_non_bg = is_rotationally_symmetric(binary_box)
+                pixel_features.append(float(h_sym_non_bg))
+                pixel_features.append(float(v_sym_non_bg))
+                pixel_features.append(float(r_sym_non_bg))
             
             # K-independent features (computed once)
             
@@ -418,31 +453,6 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 3) -> np.ndarray
             features.append(pixel_features)
     
     return np.array(features)
-
-from scipy.ndimage import label
-
-def count_connected_cells(grid, i, j, k=3, diagonal=False):
-    h, w = grid.shape
-    c = grid[i, j]
-    half_k = k // 2
-
-    i0 = max(0, i - half_k)
-    i1 = min(h, i + half_k + 1)
-    j0 = max(0, j - half_k)
-    j1 = min(w, j + half_k + 1)
-
-    box = grid[i0:i1, j0:j1]
-    color_mask = (box == c)
-
-    structure = np.ones((3,3), dtype=bool) if diagonal else np.array([[0,1,0],
-                                                                      [1,1,1],
-                                                                      [0,1,0]], dtype=bool)
-    labeled_box, _ = label(color_mask, structure=structure)
-    ci, cj = i - i0, j - j0
-    lblval = labeled_box[ci, cj]
-    if lblval == 0:
-        return 0
-    return np.sum(labeled_box == lblval)
 
 def count_connected_cells_causal(grid, center_i, center_j, k, causal_mask, diagonal=False):
     """Count connected cells of the same color in a k x k box, within the causal mask, using scipy."""

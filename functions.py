@@ -88,8 +88,8 @@ class FeatureEmbedding(nn.Module):
         self.embed_model = embed_model
         self.config = config
         d = config.hidden_size
-        self.input_features_MLP = torch.nn.Sequential(torch.nn.Linear(input_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d)).to('cuda')
-        self.output_features_MLP = torch.nn.Sequential(torch.nn.Linear(output_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d)).to('cuda')
+        self.input_features_MLP = torch.nn.Sequential(torch.nn.Linear(input_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d))
+        self.output_features_MLP = torch.nn.Sequential(torch.nn.Linear(output_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d))
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_features, output_features, input_tokens):
@@ -916,6 +916,84 @@ def find_first_exceed(task, max_len, extra_tokens=4):
     return len(task)  # If total never exceeds max_len
 
 from features_optimized import extract_features, extract_causal_features
+def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=5):
+    # only use non-causal features and predict rows, cols, and cells in outputN in one-shot.
+    BOS_X = 1  # Beginning of input grid
+    EOS_X = 2  # End of input grid
+    LINE_BREAK = 3  # Row separator
+    BOS_Y = 4  # Beginning of output grid
+    EOS_Y = 5  # End of output grid
+    INPUT_PLACEHOLDER = 6
+    PREDICT_ROW = 7
+    PREDICT_COL = 8
+    SIZE_OFFSET = 8 # size goes from 1 to 30 mapping to token space as 9 to 38
+    PAD_TOKEN = -100  # Padding/ignored token
+
+    input_tokens = []
+    target_tokens = []
+    features = []
+    n_task = find_first_exceed(task, max_length)
+    def get_token_from_grid(grid, bos_token, eos_token, placeholder_token, line_break_token, IsOutput):
+        n,m = len(grid), len(grid[0])
+        if IsOutput:
+            targets = [n + SIZE_OFFSET, m + SIZE_OFFSET]
+            tokens = [PREDICT_ROW, PREDICT_COL, bos_token]
+        else:
+            tokens = [bos_token]
+            targets = []
+        line = [placeholder_token] * len(grid[0])
+        line.append(line_break_token)
+        for _ in grid:
+            tokens.extend(line)
+        tokens.append(eos_token)
+        targets.extend([PAD_TOKEN] * (len(tokens)- len(targets)))
+        return tokens, targets
+    if IsDecode:
+        # For decoding, must include the last task
+        task = task[:n_task-1] + [task[-1]] 
+    else:
+        task = task[:n_task]
+    for x, y in task[:n_task-1]:
+        # Extract features
+        input_feature = extract_features(x, max_k=max_k, background_color=background_color) # (l, d)
+        output_feature = extract_features(y, max_k=max_k, background_color=background_color)
+        features.append(input_feature)
+        features.append(output_feature)
+        # Tokenize input
+        token, target = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK, False)
+        input_tokens.extend(token)
+        target_tokens.extend(target)
+        # Tokenize output
+        token, target = get_token_from_grid(y, BOS_Y, EOS_Y, INPUT_PLACEHOLDER, LINE_BREAK, True)
+        input_tokens.extend(token)
+        target_tokens.extend(target)
+    # Tokenize last task
+    x, y = task[-1]
+    # Tokenize input
+    input_feature = extract_features(x, max_k=max_k, background_color=background_color) # (l, d)
+    features.append(input_feature)
+    token, target = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK, False)
+    input_tokens.extend(token)
+    target_tokens.extend(target)
+    features = np.concatenate(features, axis=0)
+
+    input_tokens.append(PREDICT_ROW)
+    input_tokens.append(PREDICT_COL)
+    if IsDecode:
+        if y is None: # leaderboard
+            return torch.tensor(input_tokens), torch.tensor(features, dtype=torch.bfloat16)
+        else: # local test
+            return torch.tensor(input_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(y)
+    else:
+        row, col = len(y), len(y[0])
+        rows = [r for r in range(row) for _ in range(col)]
+        cols = [c for _ in range(row) for c in range(col)]
+        target_tokens.append(SIZE_OFFSET + row)
+        target_tokens.append(SIZE_OFFSET + col)
+        for flat_y in y:
+            target_tokens.extend(flat_y)
+        return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(rows, dtype=torch.bfloat16), torch.tensor(cols, dtype=torch.bfloat16)
+
 def tokenize_features(task, max_length, IsDecode=False, max_k=5):
     BOS_X = 10  # Beginning of input grid
     EOS_X = 11  # End of input grid
@@ -973,7 +1051,7 @@ def tokenize_features(task, max_length, IsDecode=False, max_k=5):
     return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(input_features, dtype=torch.bfloat16), torch.tensor(output_features, dtype=torch.bfloat16)
     
 
-def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False, offset1: int = 0, offset2: int = 0):
+def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False, offset1: int = 0, offset2: int = 0, background_color: int = 0):
     """
     Tokenizes a task for causal (autoregressive) training or inference,
     optionally providing 2D positional indices using optimized list extensions.
@@ -1423,8 +1501,11 @@ def data_gen(data, IsTrain, tokenize_func, apply_to_output=False, **kwargs):
         # Apply transformations only during training
         if IsTrain:
             # TODO: tansformation for decode
-            task = forwardTask(task, generateTransformPara(len(task), apply_to_output=apply_to_output))
-        
+            para = generateTransformPara(len(task), apply_to_output=apply_to_output)
+            task = forwardTask(task, para)
+            kwargs['background_color'] = para.perm_color[0]
+        else:
+            kwargs['background_color'] = 0
         # Tokenize the task
         out = tokenize_func(task, **kwargs)
         yield out
@@ -1443,7 +1524,11 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         task = self.data_source[idx]
         if self.is_train:
-            task = forwardTask(task, generateTransformPara(len(task), apply_to_output=self.apply_to_output))
+            para = generateTransformPara(len(task), apply_to_output=self.apply_to_output)
+            task = forwardTask(task, para)
+            self.kwargs['background_color'] = para.perm_color[0]
+        else:
+            self.kwargs['background_color'] = 0
         out = self.tokenize_func(task, **self.kwargs)
         return out
     
