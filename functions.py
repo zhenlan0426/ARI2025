@@ -918,15 +918,15 @@ def find_first_exceed(task, max_len, extra_tokens=4):
 from features_optimized import extract_features, extract_causal_features
 def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=5):
     # only use non-causal features and predict rows, cols, and cells in outputN in one-shot.
-    BOS_X = 1  # Beginning of input grid
-    EOS_X = 2  # End of input grid
-    LINE_BREAK = 3  # Row separator
-    BOS_Y = 4  # Beginning of output grid
-    EOS_Y = 5  # End of output grid
-    INPUT_PLACEHOLDER = 6
-    PREDICT_ROW = 7
-    PREDICT_COL = 8
-    SIZE_OFFSET = 8 # size goes from 1 to 30 mapping to token space as 9 to 38
+    BOS_X = 10  # Beginning of input grid
+    EOS_X = 11  # End of input grid
+    LINE_BREAK = 12  # Row separator
+    BOS_Y = 13  # Beginning of output grid
+    EOS_Y = 14  # End of output grid
+    INPUT_PLACEHOLDER = 15
+    PREDICT_ROW = 16
+    PREDICT_COL = 17
+    SIZE_OFFSET = 17 # size goes from 1 to 30 mapping to token space as 18 to 47
     PAD_TOKEN = -100  # Padding/ignored token
 
     input_tokens = []
