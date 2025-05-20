@@ -10,7 +10,8 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
     
     Args:
         grid: List of lists of integers between 0 and 9
-        max_k: Maximum size of the box for local features (default: 3)
+        background_color: Integer representing the background color (0-9)
+        max_k: Maximum size of the box for local features (default: 5)
     
     Returns:
         A numpy array of shape (n_pixels, n_features) containing the features for each pixel
@@ -39,6 +40,40 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
         color_mask = (grid_array == color)
         connected_labels_4way[color], _ = label(color_mask, structure=structure_4way)
         connected_labels_8way[color], _ = label(color_mask, structure=structure_8way)
+    
+    # NEW: Precompute non-background connected components for the entire grid
+    # Create a mask for non-background pixels
+    non_background_mask = (grid_array != background_color)
+    # Get connected components for non-background pixels (both 4-way and 8-way connectivity)
+    non_bg_labels_4way, num_non_bg_labels_4way = label(non_background_mask, structure=structure_4way)
+    non_bg_labels_8way, num_non_bg_labels_8way = label(non_background_mask, structure=structure_8way)
+    
+    # NEW: Precompute color distribution for each non-background component (both 4-way and 8-way)
+    non_bg_component_color_dist_4way = {}  # Will store color distributions for each 4-way component
+    non_bg_component_color_dist_8way = {}  # Will store color distributions for each 8-way component
+    for component_id in range(1, num_non_bg_labels_4way + 1):
+        # Create mask for this component
+        component_mask = (non_bg_labels_4way == component_id)
+        # Get color counts for this component
+        color_counts = np.zeros(10)
+        for color in range(10):
+            color_counts[color] = np.sum((grid_array == color) & component_mask)
+        # Normalize color counts
+        normalized_color_counts = color_counts / grid_total_pixels
+        # Store in dictionary
+        non_bg_component_color_dist_4way[component_id] = normalized_color_counts
+    
+    for component_id in range(1, num_non_bg_labels_8way + 1):
+        # Create mask for this component
+        component_mask = (non_bg_labels_8way == component_id)
+        # Get color counts for this component
+        color_counts = np.zeros(10)
+        for color in range(10):
+            color_counts[color] = np.sum((grid_array == color) & component_mask)
+        # Normalize color counts
+        normalized_color_counts = color_counts / grid_total_pixels
+        # Store in dictionary
+        non_bg_component_color_dist_8way[component_id] = normalized_color_counts
             
     # Create a matrix to store all features for all pixels
     features = []
@@ -87,6 +122,49 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
                 pixel_features.append(connected_4way / box_size)
                 pixel_features.append(connected_8way / box_size)
                 
+                # NEW: Check for non-background connected components in k x k box
+                # Extract the relevant portion of non-background labels for the box
+                box_non_bg_labels_4way = non_bg_labels_4way[box_start_i:box_end_i, box_start_j:box_end_j]
+                box_non_bg_labels_8way = non_bg_labels_8way[box_start_i:box_end_i, box_start_j:box_end_j]
+                
+                # Find the component ID at the center pixel
+                center_non_bg_label_4way = non_bg_labels_4way[i, j]
+                center_non_bg_label_8way = non_bg_labels_8way[i, j]
+                
+                # Initialize color distribution for center component in the box (4-way)
+                if center_non_bg_label_4way > 0 and center_color != background_color:
+                    # Get the box section for this component
+                    box_component_mask = (box_non_bg_labels_4way == center_non_bg_label_4way)
+                    # Compute color counts for this component in the box
+                    box_component_color_counts = np.zeros(10)
+                    for color in range(10):
+                        color_mask = (box == color)
+                        box_component_color_counts[color] = np.sum(color_mask & box_component_mask)
+                    # Normalize
+                    box_color_dist_4way = box_component_color_counts / grid_total_pixels
+                else:
+                    # No non-background component at center
+                    box_color_dist_4way = np.zeros(10)
+                
+                # Initialize color distribution for center component in the box (8-way)
+                if center_non_bg_label_8way > 0 and center_color != background_color:
+                    # Get the box section for this component
+                    box_component_mask = (box_non_bg_labels_8way == center_non_bg_label_8way)
+                    # Compute color counts for this component in the box
+                    box_component_color_counts = np.zeros(10)
+                    for color in range(10):
+                        color_mask = (box == color)
+                        box_component_color_counts[color] = np.sum(color_mask & box_component_mask)
+                    # Normalize
+                    box_color_dist_8way = box_component_color_counts / grid_total_pixels
+                else:
+                    # No non-background component at center
+                    box_color_dist_8way = np.zeros(10)
+                
+                # Add color distribution for non-background component in k x k box (both 4-way and 8-way)
+                pixel_features.extend(box_color_dist_4way)
+                pixel_features.extend(box_color_dist_8way)
+                
                 # 10. Symmetry features for k x k box
                 h_sym = is_horizontally_symmetric(box)
                 v_sym = is_vertically_symmetric(box)
@@ -125,6 +203,30 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
             
             pixel_features.append(connected_4way_grid / grid_total_pixels)
             pixel_features.append(connected_8way_grid / grid_total_pixels)
+            
+            # NEW: Add color distribution for non-background component in the entire grid
+            center_non_bg_component_4way = non_bg_labels_4way[i, j]
+            center_non_bg_component_8way = non_bg_labels_8way[i, j]
+            
+            # For 4-way connectivity
+            if center_non_bg_component_4way > 0 and center_color != background_color:
+                # Use precomputed color distribution for this component
+                grid_color_dist_4way = non_bg_component_color_dist_4way[center_non_bg_component_4way]
+            else:
+                # No non-background component at center or center is background color
+                grid_color_dist_4way = np.zeros(10)
+            
+            # For 8-way connectivity
+            if center_non_bg_component_8way > 0 and center_color != background_color:
+                # Use precomputed color distribution for this component
+                grid_color_dist_8way = non_bg_component_color_dist_8way[center_non_bg_component_8way]
+            else:
+                # No non-background component at center or center is background color
+                grid_color_dist_8way = np.zeros(10)
+            
+            # Add color distribution for non-background component in the entire grid (both 4-way and 8-way)
+            pixel_features.extend(grid_color_dist_4way)
+            pixel_features.extend(grid_color_dist_8way)
             
             # 7. Count of color in row and column of center pixel
             row_counts = np.zeros(10)
