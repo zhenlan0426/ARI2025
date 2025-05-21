@@ -81,7 +81,43 @@ class GlobalConfig:
         with open(file_path + 'globalConfig.json', 'r') as json_file:
             data = json.load(json_file)
         return cls(**data)
+    
+class CosSinEmbedding(nn.Module):
+    def __init__(self, dim=4096, theta = 30):
+        super().__init__()
+        freq = 1.0 / (theta ** (torch.arange(0, dim, 4) / dim))[None,:].float()
+        pos = torch.arange(0, theta)[:,None].float()
+        prod = pos * freq
+        cos = torch.cos(prod)
+        sin = torch.sin(prod)
+        cos_sin = torch.cat([cos, sin], dim=1) # (max_len, dim/2)
+        self.register_buffer('cos_sin', cos_sin)
 
+    def forward(self, rows, cols):
+        # rows and cols are the row / col index of shape (L) for the flattened grid
+        rows_cos_sin = self.cos_sin[rows[0]]
+        cols_cos_sin = self.cos_sin[cols[0]]
+        return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
+    
+class FeatureEmbedding2(nn.Module):
+    def __init__(self, embed_model, config, input_dim=162, hidden_dim=256):
+        super().__init__()
+        self.embed_model = embed_model
+        self.config = config
+        d = config.hidden_size
+        self.features_MLP = torch.nn.Sequential(torch.nn.Linear(input_dim,hidden_dim),torch.nn.SiLU(),torch.nn.Linear(hidden_dim,d))
+        self.cos_sin_MLP = torch.nn.Sequential(torch.nn.Linear(d,hidden_dim),torch.nn.SiLU(),torch.nn.Linear(hidden_dim,d))
+        self.cos_sin_embedding = CosSinEmbedding(dim=d)
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, features, input_tokens, rows, cols):
+        features = self.features_MLP(features) # (1, l, d)
+        embed_features = self.embed_model(input_tokens) # (1, L, d)
+        embed_features = embed_features.masked_scatter((input_tokens==15)[...,None], features) # (1, L, d)
+        embed_features = torch.cat([embed_features, self.cos_sin_MLP(self.cos_sin_embedding(rows, cols))], dim=1) # (1, L+l, d)
+        embed_features = self.norm(embed_features)
+        return embed_features
+    
 class FeatureEmbedding(nn.Module):
     def __init__(self, embed_model, config, input_dim=94, output_dim=74):
         super().__init__()
@@ -992,9 +1028,10 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
         target_tokens.append(SIZE_OFFSET + col)
         for flat_y in y:
             target_tokens.extend(flat_y)
-        return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(rows, dtype=torch.bfloat16), torch.tensor(cols, dtype=torch.bfloat16)
+        return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(rows), torch.tensor(cols)
 
-def tokenize_features(task, max_length, IsDecode=False, max_k=5):
+def tokenize_features(task, max_length, IsDecode=False, max_k=5, **kwargs):
+    # TODO: extract_causal_features needs to be updated as extract_features
     BOS_X = 10  # Beginning of input grid
     EOS_X = 11  # End of input grid
     LINE_BREAK = 12  # Row separator
