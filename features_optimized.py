@@ -299,6 +299,7 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
     Returns:
         A numpy array of shape (n_pixels, n_features) containing the features for each pixel
     """
+    # TODO: extract_causal_features needs to be updated as extract_features
     # Convert grid to numpy array
     grid_array = np.array(grid, dtype=int)
     height, width = grid_array.shape
