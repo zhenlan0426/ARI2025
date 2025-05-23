@@ -100,7 +100,7 @@ class CosSinEmbedding(nn.Module):
         return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
     
 class FeatureEmbedding2(nn.Module):
-    def __init__(self, embed_model, config, input_dim=162, hidden_dim1=4096, hidden_dim2=256, dropout=0.1):
+    def __init__(self, embed_model, config, input_dim=164, hidden_dim1=4096, hidden_dim2=128, dropout=0.17):
         super().__init__()
         self.embed_model = embed_model
         self.config = config
@@ -979,11 +979,14 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
     def get_token_from_grid(grid, bos_token, eos_token, placeholder_token, line_break_token, IsOutput):
         n,m = len(grid), len(grid[0])
         if IsOutput:
+            tokens = [PREDICT_ROW, PREDICT_COL]
             targets = [n + SIZE_OFFSET, m + SIZE_OFFSET]
-            tokens = [PREDICT_ROW, PREDICT_COL, bos_token]
         else:
-            tokens = [bos_token]
+            tokens = []
             targets = []
+        tokens.append(n + SIZE_OFFSET)
+        tokens.append(m + SIZE_OFFSET)
+        tokens.append(bos_token)
         line = [placeholder_token] * len(grid[0])
         line.append(line_break_token)
         for _ in grid:
@@ -1000,8 +1003,10 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
         # Extract features
         input_feature = extract_features(x, max_k=max_k, background_color=background_color) # (l, d)
         output_feature = extract_features(y, max_k=max_k, background_color=background_color)
-        features.append(input_feature)
-        features.append(output_feature)
+        rnd = np.random.rand()
+        l1, l2 = input_feature.shape[0], output_feature.shape[0]
+        features.append(np.concatenate([input_feature, np.zeros((l1,1)), np.ones((l1,1)) * rnd],1))
+        features.append(np.concatenate([output_feature, np.ones((l2,1)), np.ones((l2,1)) * rnd],1))        
         # Tokenize input
         token, target = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK, False)
         input_tokens.extend(token)
@@ -1014,7 +1019,9 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
     x, y = task[-1]
     # Tokenize input
     input_feature = extract_features(x, max_k=max_k, background_color=background_color) # (l, d)
-    features.append(input_feature)
+    rnd = np.random.rand()
+    l1 = input_feature.shape[0]
+    features.append(np.concatenate([input_feature, np.zeros((l1,1)), np.ones((l1,1)) * rnd],1))
     token, target = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK, False)
     input_tokens.extend(token)
     target_tokens.extend(target)
