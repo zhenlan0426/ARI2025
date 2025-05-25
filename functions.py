@@ -99,90 +99,6 @@ class CosSinEmbedding(nn.Module):
         cols_cos_sin = self.cos_sin[cols[0]]
         return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
     
-class AutomaticWeightedLoss(nn.Module):
-    """automatically weighted multi-task loss
-
-    Params：
-        num: int，the number of loss
-        x: multi-task loss
-    Examples：
-        loss1=1
-        loss2=2
-        awl = AutomaticWeightedLoss(2)
-        loss_sum = awl(loss1, loss2)
-    """
-    def __init__(self, num=2):
-        super(AutomaticWeightedLoss, self).__init__()
-        params = torch.ones(num, requires_grad=True)
-        self.params = torch.nn.Parameter(params)
-
-    def forward(self, *x):
-        loss_sum = 0
-        for i, loss in enumerate(x):
-            loss_sum += 0.5 / (self.params[i] ** 2) * loss + torch.log(1 + self.params[i] ** 2)
-        return loss_sum
-    
-class SizeHead(nn.Module):
-    def __init__(self, hidden_size, multiplier=2):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.size_embed = nn.Embedding(30, hidden_size)
-        self.size_embed.weight.data.normal_(0, 0.01)
-        self.multiplier = multiplier
-        self.num_heads = 32
-        self.head_dim = hidden_size * self.multiplier // self.num_heads
-        
-        # query is last hidden state, row and col stacked, hence 3
-        self.q_proj = nn.Linear(hidden_size * 3, hidden_size * self.multiplier, bias=False)
-        # key and value are stacked input_i and output_i, hence 6
-        self.k_proj = nn.Linear(hidden_size * 6, hidden_size * self.multiplier, bias=False)
-        self.v_proj = nn.Linear(hidden_size * 6, hidden_size * self.multiplier, bias=False)
-        # need to predict output row and col, hence 2
-        self.o_proj = nn.Linear(hidden_size * self.multiplier, hidden_size * 2, bias=False)
-    
-    def forward(self, outputs, sizes, length):
-        # length gives the position of last token for prior input / output. [0] to remove batch dimension
-        # sizes is of shape (1, l, 2), l is the number of examples, last l is the input_N. 2 is row and col
-        summary = outputs.last_hidden_state[:, length[0]] # (1, l, hidden_size)
-        
-        # Process sizes
-        size_embeds = self.size_embed(sizes)  # (1, l, 2, hidden_size)
-        size_embeds = size_embeds.view(1, size_embeds.shape[1], -1)  # (1, l, hidden_size * 2)
-        
-        # Concatenate summary with size embeddings
-        summary = torch.cat([summary, size_embeds], dim=2)  # (1, l, hidden_size * 3)
-        
-        # Extract input and KVs
-        input_vec = summary[:, -1]  # (1, hidden_size * 3) for input_N
-        KVs = summary[:, :-1]  # (1, l, hidden_size * 3) for prior input_i and output_i
-        
-        # Pair up input_i and output_i
-        KVs = torch.cat([KVs[:,::2], KVs[:,1::2]], dim=2)  # (1, l//2, hidden_size * 6)
-        
-        if KVs.shape[1] == 1: # only one element to attend to
-            attn_output = self.v_proj(KVs)[0]  # (1, hidden_size * multiplier)
-        else:
-            # Project query, key, and value
-            query = self.q_proj(input_vec)[:, None]  # (1, 1, hidden_size * multiplier)
-            K = self.k_proj(KVs)  # (1, l, hidden_size * multiplier)
-            V = self.v_proj(KVs)  # (1, l, hidden_size * multiplier)
-            
-            # Reshape for multi-head attention
-            query = query.view(1, 1, self.num_heads, self.head_dim).transpose(1, 2) # (1, num_heads, 1, head_dim)
-            K = K.view(1, K.shape[1], self.num_heads, self.head_dim).transpose(1, 2) # (1, num_heads, l, head_dim)
-            V = V.view(1, V.shape[1], self.num_heads, self.head_dim).transpose(1, 2) # (1, num_heads, l, head_dim)
-            
-            # Apply attention
-            attn_output = nn.functional.scaled_dot_product_attention(query, K, V, is_causal=False) # (1, num_heads, 1, head_dim)
-            attn_output = attn_output[:,:,0].view(1, -1)  # (1, hidden_size * multiplier)
-        
-        # Final projection and output
-        out = self.o_proj(attn_output) + input_vec[:, self.hidden_size:] # (1, hidden_size * 2)
-        out = out.view(2, -1) # (2, hidden_size)
-        size_logits = out @ self.size_embed.weight.T # (2, 30)
-        
-        return size_logits
-        
 class FeatureEmbedding2(nn.Module):
     def __init__(self, embed_model, config, input_dim=164, hidden_dim1=4096, hidden_dim2=128, dropout=0.17):
         super().__init__()
@@ -430,7 +346,6 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
     PAD_TOKEN = -100  # Padding/ignored token
 
     input_tokens = []
-    target_tokens = []
     features = []
     # randomly sample how many tasks to use, various context length can help generalization
     if random_context:
@@ -438,14 +353,9 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
     else:
         r = len(task)
     n_task = min(find_first_exceed(task, max_length), r)
-    def get_token_from_grid(grid, bos_token, eos_token, placeholder_token, line_break_token, IsOutput):
+    def get_token_from_grid(grid, bos_token, eos_token, placeholder_token, line_break_token):
         n,m = len(grid), len(grid[0])
-        if IsOutput:
-            tokens = [PREDICT_ROW, PREDICT_COL]
-            targets = [n + SIZE_OFFSET, m + SIZE_OFFSET]
-        else:
-            tokens = []
-            targets = []
+        tokens = []
         tokens.append(bos_token)
         line = [placeholder_token] * len(grid[0])
         line.append(line_break_token)
@@ -454,8 +364,7 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
         tokens.append(eos_token)
         tokens.append(n + SIZE_OFFSET)
         tokens.append(m + SIZE_OFFSET)
-        targets.extend([PAD_TOKEN] * (len(tokens)- len(targets)))
-        return tokens, targets
+        return tokens
     if IsDecode:
         # For decoding, must include the last task
         task = task[:n_task-1] + [task[-1]] 
@@ -470,13 +379,12 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
         features.append(np.concatenate([input_feature, np.zeros((l1,1)), np.ones((l1,1)) * rnd],1))
         features.append(np.concatenate([output_feature, np.ones((l2,1)), np.ones((l2,1)) * rnd],1))        
         # Tokenize input
-        token, target = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK, False)
+        token = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK)
         input_tokens.extend(token)
-        target_tokens.extend(target)
+        
         # Tokenize output
-        token, target = get_token_from_grid(y, BOS_Y, EOS_Y, INPUT_PLACEHOLDER, LINE_BREAK, True)
+        token = get_token_from_grid(y, BOS_Y, EOS_Y, INPUT_PLACEHOLDER, LINE_BREAK)
         input_tokens.extend(token)
-        target_tokens.extend(target)
     # Tokenize last task
     x, y = task[-1]
     # Tokenize input
@@ -484,9 +392,8 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
     rnd = np.random.rand()
     l1 = input_feature.shape[0]
     features.append(np.concatenate([input_feature, np.zeros((l1,1)), np.ones((l1,1)) * rnd],1))
-    token, target = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK, False)
+    token = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK)
     input_tokens.extend(token)
-    target_tokens.extend(target)
     features = np.concatenate(features, axis=0)
 
     input_tokens.append(PREDICT_ROW)
@@ -497,11 +404,12 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
         else: # local test
             return torch.tensor(input_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(y)
     else:
+        target_tokens = []
         row, col = len(y), len(y[0])
         rows = [r for r in range(row) for _ in range(col)]
         cols = [c for _ in range(row) for c in range(col)]
-        target_tokens.append(SIZE_OFFSET + row)
-        target_tokens.append(SIZE_OFFSET + col)
+        target_tokens.append(row-1) # -1 for 0-indexed
+        target_tokens.append(col-1) # -1 for 0-indexed
         for flat_y in y:
             target_tokens.extend(flat_y)
         return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(rows), torch.tensor(cols)
