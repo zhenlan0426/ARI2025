@@ -99,6 +99,90 @@ class CosSinEmbedding(nn.Module):
         cols_cos_sin = self.cos_sin[cols[0]]
         return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
     
+class AutomaticWeightedLoss(nn.Module):
+    """automatically weighted multi-task loss
+
+    Params：
+        num: int，the number of loss
+        x: multi-task loss
+    Examples：
+        loss1=1
+        loss2=2
+        awl = AutomaticWeightedLoss(2)
+        loss_sum = awl(loss1, loss2)
+    """
+    def __init__(self, num=2):
+        super(AutomaticWeightedLoss, self).__init__()
+        params = torch.ones(num, requires_grad=True)
+        self.params = torch.nn.Parameter(params)
+
+    def forward(self, *x):
+        loss_sum = 0
+        for i, loss in enumerate(x):
+            loss_sum += 0.5 / (self.params[i] ** 2) * loss + torch.log(1 + self.params[i] ** 2)
+        return loss_sum
+    
+class SizeHead(nn.Module):
+    def __init__(self, hidden_size, multiplier=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.size_embed = nn.Embedding(30, hidden_size)
+        self.size_embed.weight.data.normal_(0, 0.01)
+        self.multiplier = multiplier
+        self.num_heads = 32
+        self.head_dim = hidden_size * self.multiplier // self.num_heads
+        
+        # query is last hidden state, row and col stacked, hence 3
+        self.q_proj = nn.Linear(hidden_size * 3, hidden_size * self.multiplier, bias=False)
+        # key and value are stacked input_i and output_i, hence 6
+        self.k_proj = nn.Linear(hidden_size * 6, hidden_size * self.multiplier, bias=False)
+        self.v_proj = nn.Linear(hidden_size * 6, hidden_size * self.multiplier, bias=False)
+        # need to predict output row and col, hence 2
+        self.o_proj = nn.Linear(hidden_size * self.multiplier, hidden_size * 2, bias=False)
+    
+    def forward(self, outputs, sizes, length):
+        # length gives the position of last token for prior input / output. [0] to remove batch dimension
+        # sizes is of shape (1, l, 2), l is the number of examples, last l is the input_N. 2 is row and col
+        summary = outputs.last_hidden_state[:, length[0]] # (1, l, hidden_size)
+        
+        # Process sizes
+        size_embeds = self.size_embed(sizes)  # (1, l, 2, hidden_size)
+        size_embeds = size_embeds.view(1, size_embeds.shape[1], -1)  # (1, l, hidden_size * 2)
+        
+        # Concatenate summary with size embeddings
+        summary = torch.cat([summary, size_embeds], dim=2)  # (1, l, hidden_size * 3)
+        
+        # Extract input and KVs
+        input_vec = summary[:, -1]  # (1, hidden_size * 3) for input_N
+        KVs = summary[:, :-1]  # (1, l, hidden_size * 3) for prior input_i and output_i
+        
+        # Pair up input_i and output_i
+        KVs = torch.cat([KVs[:,::2], KVs[:,1::2]], dim=2)  # (1, l//2, hidden_size * 6)
+        
+        if KVs.shape[1] == 1: # only one element to attend to
+            attn_output = self.v_proj(KVs)[0]  # (1, hidden_size * multiplier)
+        else:
+            # Project query, key, and value
+            query = self.q_proj(input_vec)[:, None]  # (1, 1, hidden_size * multiplier)
+            K = self.k_proj(KVs)  # (1, l, hidden_size * multiplier)
+            V = self.v_proj(KVs)  # (1, l, hidden_size * multiplier)
+            
+            # Reshape for multi-head attention
+            query = query.view(1, 1, self.num_heads, self.head_dim).transpose(1, 2) # (1, num_heads, 1, head_dim)
+            K = K.view(1, K.shape[1], self.num_heads, self.head_dim).transpose(1, 2) # (1, num_heads, l, head_dim)
+            V = V.view(1, V.shape[1], self.num_heads, self.head_dim).transpose(1, 2) # (1, num_heads, l, head_dim)
+            
+            # Apply attention
+            attn_output = nn.functional.scaled_dot_product_attention(query, K, V, is_causal=False) # (1, num_heads, 1, head_dim)
+            attn_output = attn_output[:,:,0].view(1, -1)  # (1, hidden_size * multiplier)
+        
+        # Final projection and output
+        out = self.o_proj(attn_output) + input_vec[:, self.hidden_size:] # (1, hidden_size * 2)
+        out = out.view(2, -1) # (2, hidden_size)
+        size_logits = out @ self.size_embed.weight.T # (2, 30)
+        
+        return size_logits
+        
 class FeatureEmbedding2(nn.Module):
     def __init__(self, embed_model, config, input_dim=164, hidden_dim1=4096, hidden_dim2=128, dropout=0.17):
         super().__init__()
@@ -138,710 +222,6 @@ class FeatureEmbedding(nn.Module):
         embed_features = embed_features.masked_scatter((input_tokens==7)[...,None], output_features)
         embed_features = self.norm(embed_features)
         return embed_features
-
-# class PositionalEmbedding2D(nn.Module):
-#     """
-#     Adds 2D positional embeddings to a flattened grid input.
-
-#     Assumes the input `x` is of shape (batch_size, seq_len, hidden_dim),
-#     where seq_len is height * width, and the flattening order is row-first.
-
-#     The positional embedding is the sum of a learnable row embedding and a
-#     learnable column embedding.
-#     """
-#     def __init__(self, hidden_dim: int, max_height: int=31, max_width: int=31):
-#         """
-#         Initializes the 2D positional embedding layer.
-
-#         Args:
-#             hidden_dim (int): The dimensionality of the embeddings and the input tensor.
-#             max_height (int): The maximum expected height of the 2D grid.
-#                                Used to size the row embedding table.
-#             max_width (int): The maximum expected width of the 2D grid.
-#                               Used to size the column embedding table.
-#         """
-#         super().__init__()
-#         self.hidden_dim = hidden_dim
-#         self.max_height = max_height
-#         self.max_width = max_width
-#         self.row_embed = nn.Embedding(max_height, hidden_dim)
-#         self.col_embed = nn.Embedding(max_width, hidden_dim)
-
-
-#     def reset_parameters(self,r,c):
-#         # r,c should be of shape (1, seq) on the right device
-#         self.r = r
-#         self.c = c
-
-#     def forward(self, module, input, output):
-#         """
-#         to match signature forward hook
-#         """
-#         # Look up embeddings for row and column indices
-#         # self.row_embed(rows) -> Shape: [seq_len, hidden_dim]
-#         # self.col_embed(cols) -> Shape: [seq_len, hidden_dim]
-#         row_pos_embedding = self.row_embed(self.r)
-#         col_pos_embedding = self.col_embed(self.c)
-
-#         return output + row_pos_embedding + col_pos_embedding
-#         # Need __call__ to delegate to forward for hook registration if using nn.Module
-#     def __call__(self, module, input, output):
-#         return self.forward(module, input, output)
-    
-# class _RelPos2D(torch.autograd.Function):
-#     @staticmethod
-#     def forward(ctx, bias_param, rows, cols, layer_idx):
-#         # save just the *bare minimum* for backward
-#         layers, H, max_h, max_w = bias_param.shape
-#         ctx.save_for_backward(rows, cols)
-#         ctx.layer_idx = layer_idx
-#         ctx.max_h = max_h
-#         ctx.max_w = max_w
-#         ctx.layers = layers
-#         ctx.H = H
-#         # do exactly the same fancy indexing
-#         h_idxs = torch.clamp(rows.unsqueeze(0) - rows.unsqueeze(1), 0, max_h-1)
-#         w_idxs = torch.clamp(cols.unsqueeze(0) - cols.unsqueeze(1), 0, max_w-1)
-#         out = bias_param[layer_idx:layer_idx+1, :, h_idxs, w_idxs]
-#         return out
-
-#     @staticmethod
-#     def backward(ctx, grad_out):
-#         rows, cols = ctx.saved_tensors
-#         layer_idx, max_h, max_w, layers, H = ctx.layer_idx, ctx.max_h, ctx.max_w, ctx.layers, ctx.H
-#         # rows and cols are 1-indexed, so it does not work with h_idxs * max_w + w_idxs
-#         rows -= 1
-#         cols -= 1
-#         # 1) recompute the 2D offsets
-#         h_idxs = torch.clamp(rows.unsqueeze(0) - rows.unsqueeze(1), 0, max_h-1)
-#         w_idxs = torch.clamp(cols.unsqueeze(0) - cols.unsqueeze(1), 0, max_w-1)
-
-#         # 2) flatten the 2D grid of offsets into single linear indices
-#         #    idx_flat[i,j] = h_idxs[i,j] * max_width + w_idxs[i,j]
-#         idx_flat = (h_idxs * max_w + w_idxs).view(-1)                  # (L*L,)
-
-#         # 3) flatten grad_out too
-#         g_flat = grad_out[0].view(H, -1)                               # (H, L*L)
-
-#         # 4) make a zero grad buffer for the entire param
-#         d_bias = torch.zeros(layers, H, max_h, max_w, device=grad_out.device, dtype=grad_out.dtype)  # (layers, H, max_h, max_w)
-
-#         # 5) we only write into layer layer_idx, so take a view:
-#         db_li = d_bias[layer_idx].view(H, -1)                                 # (H, max_h*max_w)
-
-#         # 6) scatter_add along dim=1 using our flat indices
-#         #    each head h adds g_flat[h,k] into db_li[h, idx_flat[k]]
-#         db_li.scatter_add_(1, idx_flat.unsqueeze(0).expand(H, -1), g_flat)
-
-#         return d_bias, None, None, None
-        
-# class WithinGrid2DAttnScore(nn.Module):
-#     def __init__(self, layers, heads, max_height_delta, max_width_delta):
-#         super().__init__()
-#         self.layers = layers
-#         self.heads = heads
-#         self.max_height_delta = max_height_delta
-#         self.max_width_delta = max_width_delta
-#         # Parameter: (layers, heads, max_height_delta, max_width_delta)
-#         self.relative_position_bias = nn.Parameter(
-#             torch.empty(self.layers,
-#                         self.heads,
-#                         self.max_height_delta,
-#                         self.max_width_delta)
-#         )
-#         # Initialize parameters (e.g., small random values or zeros)
-#         nn.init.normal_(self.relative_position_bias, std=0.01)
-
-#     def forward(self, rows: torch.LongTensor, cols: torch.LongTensor, layer_idx: int):
-#         # Compute distance matrices (L, L)
-#         height_indices = (rows.unsqueeze(0) - rows.unsqueeze(1))  # (L, L)
-#         width_indices = (cols.unsqueeze(0) - cols.unsqueeze(1))   # (L, L)
-#         height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
-#         width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
-#         # Return shape (1, heads, L, L)
-#         if self.layers == 1:
-#             scores = self.relative_position_bias[:, :, height_indices, width_indices]
-#         else:
-#             scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
-#         return scores
-    
-# class AcrossGrid2DAttnScore(WithinGrid2DAttnScore):
-#     def __init__(self, layers, heads, max_height_delta, max_width_delta):
-#         super().__init__(layers, heads, max_height_delta, max_width_delta)
-
-#     def forward(self, rows1: torch.LongTensor, cols1: torch.LongTensor, rows2: torch.LongTensor, cols2: torch.LongTensor, layer_idx: int):
-#         '''
-#         rows1, cols1 are the coordinates of the input grid of shape (L,)
-#         rows2, cols2 are the coordinates of the output grid of shape (l,)
-#         returns a tensor of shape (1, heads, l, L), relative bias is left corner aligned, i.e. input (0,0) is aligned with output (0,0)
-#         '''
-#         # Compute distance matrices (l, L)
-#         height_indices = (rows2.unsqueeze(1) - rows1.unsqueeze(0))  # (l, L)
-#         width_indices = (cols2.unsqueeze(1) - cols1.unsqueeze(0))   # (l, L)
-
-#         # to map a delta of 0 to the middle of the parameter's dimension.
-#         height_center = (self.max_height_delta - 1) // 2
-#         width_center = (self.max_width_delta - 1) // 2
-#         height_indices += height_center
-#         width_indices += width_center
-#         height_indices = torch.clamp(height_indices, 0, self.max_height_delta - 1)
-#         width_indices = torch.clamp(width_indices, 0, self.max_width_delta - 1)
-
-#         # Return shape (1, heads, l, L)
-#         if self.layers == 1:
-#             scores = self.relative_position_bias[:, :, height_indices, width_indices]
-#         else:
-#             scores = self.relative_position_bias[layer_idx:layer_idx+1, :, height_indices, width_indices]
-
-#         # Causal mask: i > j -> -inf
-#         # causal_mask = torch.triu(torch.ones(L, L, device=rows.device), diagonal=1).bool()
-#         # scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(torch.bfloat16).min)
-
-#         return scores
-
-# class MultiGridAttention(nn.Module):
-#     """
-#     A module that computes attention scores for multiple grids in a sequence.
-    
-#     This module handles both within-grid attention (tokens attending to other tokens in the same grid)
-#     and across-grid attention (tokens in output grid attending to tokens in input grid).
-#     It's designed to work with 2D grid structures where each token has a row and column position.
-    
-#     The module creates a full attention bias matrix that can be added to the standard attention scores
-#     in transformer models, enabling spatial awareness in the attention mechanism.
-    
-#     Args:
-#         layers (int): Number of transformer layers.
-#         heads (int): Number of attention heads per layer.
-#         max_height_delta1 (int): Maximum height difference for within-grid attention.
-#         max_width_delta1 (int): Maximum width difference for within-grid attention.
-#         max_height_delta2 (int): Maximum height difference for across-grid attention.
-#         max_width_delta2 (int): Maximum width difference for across-grid attention.
-#     """
-#     def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int):
-#         super().__init__()
-        
-#         # Within-grid attention (same for all grids)
-#         self.within_grid_attn = WithinGrid2DAttnScore(
-#             layers, heads, max_height_delta1, max_width_delta1
-#         )
-        
-#         # Across-grid attention (for y_i attending to x_i)
-#         self.across_grid_attn = AcrossGrid2DAttnScore(
-#             layers, heads, max_height_delta2, max_width_delta2
-#         )
-        
-#         # State variables
-#         self.rows = None
-#         self.cols = None
-#         self.lengths = None
-    
-#     def set_indices(self, rows, cols, lengths):
-#         """Set the row, column indices and lengths for attention computation."""
-#         self.rows = rows
-#         self.cols = cols
-#         self.lengths = lengths
-    
-#     def forward(self, layer_idx):
-#         """
-#         Constructs a full attention score matrix combining within-grid and across-grid attention.
-        
-#         Args:
-#             layer_idx: Int specifying which layer's attention scores to return
-            
-#         Returns:
-#             attention_biases: Tensor of shape (1, heads, L, L)
-#         """
-#         rows, cols, lengths = self.rows, self.cols, self.lengths
-#         device = rows.device
-#         total_length = rows.size(0)
-#         heads = self.within_grid_attn.heads
-        
-#         # Initialize attention bias matrix with zeros
-#         attention_biases = torch.zeros(
-#             (1, heads, total_length, total_length), 
-#             device=device
-#         )
-        
-#         # Keep track of current position in the sequence
-#         current_pos = 0
-        
-#         # Process each input-output pair
-#         # Calculate number of complete pairs and check if there's an unpaired input (decoding)
-#         num_complete_pairs = len(lengths) // 2
-#         has_unpaired_input = len(lengths) % 2 == 1
-        
-#         # Process each input-output pair
-#         for pair_idx in range(num_complete_pairs):
-#             # Get indices for current input (x_i) and output (y_i)
-#             x_start = current_pos
-#             x_end = x_start + lengths[pair_idx * 2]
-#             y_start = x_end
-#             y_end = y_start + lengths[pair_idx * 2 + 1]
-            
-#             # Extract coordinates for current input and output
-#             x_rows = rows[x_start:x_end]
-#             x_cols = cols[x_start:x_end]
-#             y_rows = rows[y_start:y_end]
-#             y_cols = cols[y_start:y_end]
-            
-#             # 1. Within-grid attention for input (x_i to x_i)
-#             x_to_x_bias = self.within_grid_attn(x_rows, x_cols, layer_idx)
-#             attention_biases[:, :, x_start:x_end, x_start:x_end] = x_to_x_bias
-            
-#             # 2. Within-grid attention for output (y_i to y_i)
-#             y_to_y_bias = self.within_grid_attn(y_rows, y_cols, layer_idx)
-#             attention_biases[:, :, y_start:y_end, y_start:y_end] = y_to_y_bias
-            
-#             # 3. Across-grid attention for output attending to input (y_i to x_i)
-#             y_to_x_bias = self.across_grid_attn(x_rows, x_cols, y_rows, y_cols, layer_idx)
-#             attention_biases[:, :, y_start:y_end, x_start:x_end] = y_to_x_bias
-            
-#             # Update current position
-#             current_pos = y_end
-        
-#         # Handle the unpaired input if it exists
-#         if has_unpaired_input:
-#             # Get indices for the unpaired input
-#             x_start = current_pos
-#             x_end = x_start + lengths[-1]
-            
-#             # Extract coordinates for unpaired input
-#             x_rows = rows[x_start:x_end]
-#             x_cols = cols[x_start:x_end]
-            
-#             # Only apply within-grid attention for the unpaired input
-#             x_to_x_bias = self.within_grid_attn(x_rows, x_cols, layer_idx)
-#             attention_biases[:, :, x_start:x_end, x_start:x_end] = x_to_x_bias
-            
-#             # Update current position
-#             current_pos = x_end
-        
-#         # 1. Special token handling: zero out rows/cols where row value is 0 (special tokens)
-#         special_token_mask = (rows == 0)
-#         # Create mask for special tokens in attention matrix (both rows and columns)
-#         special_row_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
-#             1, heads, total_length, total_length
-#         )
-#         special_col_mask = special_token_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
-#             1, heads, total_length, total_length
-#         )
-            
-#         # Zero out attention scores for special tokens
-#         attention_biases.masked_fill_(special_row_mask, 0.0)
-#         attention_biases.masked_fill_(special_col_mask, 0.0)
-        
-#         # 2. Apply causal mask to ensure past tokens don't attend to future tokens
-#         causal_mask = torch.triu(
-#             torch.ones(total_length, total_length, device=device), 
-#             diagonal=1
-#         ).bool()
-#         attention_biases.masked_fill_(
-#             causal_mask.unsqueeze(0).unsqueeze(0), 
-#             torch.finfo(torch.bfloat16).min  # Use -inf for bfloat16
-#         )
-        
-#         return attention_biases
-
-# class _MultiGridAttn(torch.autograd.Function):
-
-#     @staticmethod
-#     def forward(ctx,
-#                 within_bias,    # (layers, H, mh1, mw1)
-#                 across_bias,    # (layers, H, mh2, mw2)
-#                 lengths,        # small Python list of ints
-#                 layer_idx,      # int
-#                 cached_indices, # dict of precomputed indices
-#                 sp_mask,        # (L,L)
-#                 causal,         # (L,L)
-#                 attn           # (1, H, L, L)
-#                ):
-#         # unpack
-#         layers, H, mh1, mw1 = within_bias.shape
-#         _,      _, mh2, mw2 = across_bias.shape
-#         L = attn.shape[2]
-
-#         # Zero out the attention tensor
-#         # attn.zero_()
-
-#         Npairs = len(lengths)//2
-#         has_tail = (len(lengths) % 2 == 1)
-
-#         for i in range(Npairs):
-#             # Use cached indices
-#             hdx, wdx, xs, xe = cached_indices[f'x2x_{i}']
-#             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx] # += to avoid overwriting as we zeroed out the attention
-            
-#             hdy, wdy, ys, ye = cached_indices[f'y2y_{i}']
-#             attn[:, :, ys:ye, ys:ye] = within_bias[layer_idx:layer_idx+1, :, hdy, wdy]
-            
-#             hdxy, wdxy, ys, ye, xs, xe = cached_indices[f'y2x_{i}']
-#             attn[:, :, ys:ye, xs:xe] = across_bias[layer_idx:layer_idx+1, :, hdxy, wdxy]
-
-#         if has_tail:
-#             hdx, wdx, xs, xe = cached_indices['tail']
-#             attn[:, :, xs:xe, xs:xe] = within_bias[layer_idx:layer_idx+1, :, hdx, wdx]
-
-#         # --- special‐token zeroing ---
-#         attn.masked_fill_(sp_mask.view(1,1,L,L), 0.0)
-
-#         # --- causal mask ---
-#         attn.masked_fill_(causal.view(1,1,L,L), torch.finfo(attn.dtype).min)
-
-#         # Save input tensors for backward
-#         ctx.save_for_backward(within_bias, across_bias)  # Save original tensors
-#         ctx.lengths = lengths
-#         ctx.layer_idx = layer_idx
-#         ctx.shapes = (layers, H, mh1, mw1, mh2, mw2)
-#         ctx.cached_indices = cached_indices
-#         ctx.sp_mask = sp_mask
-#         ctx.causal = causal
-
-#         return attn
-
-#     @staticmethod
-#     def backward(ctx, grad_attn):
-#         within_bias, across_bias = ctx.saved_tensors
-#         lengths = ctx.lengths
-#         layer_idx = ctx.layer_idx
-#         layers, H, mh1, mw1, mh2, mw2 = ctx.shapes
-#         cached_indices = ctx.cached_indices
-#         sp_mask = ctx.sp_mask
-#         causal = ctx.causal
-#         L = grad_attn.shape[2]
-
-#         # re‐zero out masked positions so no grad leaks
-#         full_mask = (sp_mask | causal).view(1,1,L,L)
-#         grad_attn.masked_fill_(full_mask, 0.0)
-
-#         # Create empty grad tensors with same shape as inputs if they don't exist
-#         if within_bias.grad is None:
-#             within_bias.grad = torch.zeros_like(within_bias, device=within_bias.device, dtype=within_bias.dtype)
-#         if across_bias.grad is None:
-#             across_bias.grad = torch.zeros_like(across_bias, device=across_bias.device, dtype=across_bias.dtype)
-
-#         Npairs = len(lengths)//2
-#         has_tail = (len(lengths)%2==1)
-        
-#         for i in range(Npairs):
-#             # Use cached indices for gradients
-#             hdx, wdx, xs, xe = cached_indices[f'x2x_{i}']
-#             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
-#             idx = hdx.reshape(-1) * mw1 + wdx.reshape(-1)
-#             # Accumulate directly into .grad attribute
-#             within_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
-#                                                          idx.unsqueeze(0).expand(H, -1),
-#                                                          g_xx.to(within_bias.dtype))
-            
-#             hdy, wdy, ys, ye = cached_indices[f'y2y_{i}']
-#             g_yy = grad_attn[0, :, ys:ye, ys:ye].reshape(H, -1)
-#             idx = hdy.reshape(-1) * mw1 + wdy.reshape(-1)
-#             within_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
-#                                                          idx.unsqueeze(0).expand(H, -1),
-#                                                          g_yy.to(within_bias.dtype))
-            
-#             hdxy, wdxy, ys, ye, xs, xe = cached_indices[f'y2x_{i}']
-#             g_yx = grad_attn[0, :, ys:ye, xs:xe].reshape(H, -1)
-#             idx = hdxy.reshape(-1) * mw2 + wdxy.reshape(-1)
-#             across_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
-#                                                          idx.unsqueeze(0).expand(H, -1),
-#                                                          g_yx.to(across_bias.dtype))
-
-#         if has_tail:
-#             hdx, wdx, xs, xe = cached_indices['tail']
-#             g_xx = grad_attn[0, :, xs:xe, xs:xe].reshape(H, -1)
-#             idx = hdx.reshape(-1) * mw1 + wdx.reshape(-1)
-#             within_bias.grad[layer_idx].view(H, -1).scatter_add_(1,
-#                                                          idx.unsqueeze(0).expand(H, -1),
-#                                                          g_xx.to(within_bias.dtype))
-
-#         # Return None for gradients as we've directly modified the .grad attributes
-#         return None, None, None, None, None, None, None, None,
-
-# class MultiGridAttention2(nn.Module):
-#     def __init__(self, layers: int, heads: int, max_height_delta1: int, max_width_delta1: int, max_height_delta2: int, max_width_delta2: int, device: str = 'cuda'):
-#         super().__init__()
-        
-#         # Within-grid attention (same for all grids)
-#         self.within_grid_attn_bias = nn.Parameter(
-#                                     torch.empty(layers,
-#                                                 heads,
-#                                                 max_height_delta1,
-#                                                 max_width_delta1)
-#                                 )
-#         # Initialize with 2D multivariate normal centered at (0,0) with different std per head
-#         pattern = self._attention_init(
-#             heads=heads,
-#             max_height=max_height_delta1,
-#             max_width=max_width_delta1,
-#             start_std=1,
-#             end_std=20,
-#             is_centered=False,
-#             device=device
-#         )
-#         # Apply the same pattern to all layers
-#         self.within_grid_attn_bias.data = pattern.view(1, heads, max_height_delta1, max_width_delta1).repeat(layers, 1, 1, 1)
-        
-#         # Across-grid attention (for y_i attending to x_i)
-#         self.across_grid_attn_bias = nn.Parameter(
-#                                     torch.empty(layers,
-#                                                 heads,
-#                                                 max_height_delta2,
-#                                                 max_width_delta2)
-#                                 )
-        
-#         # Initialize with 2D multivariate normal centered at (max_height_delta2//2, max_width_delta2//2)
-#         pattern = self._attention_init(
-#             heads=heads,
-#             max_height=max_height_delta2,
-#             max_width=max_width_delta2,
-#             start_std=1,
-#             end_std=35,
-#             is_centered=True,
-#             device=device
-#         )
-        
-#         # Apply the same pattern to all layers
-#         self.across_grid_attn_bias.data = pattern.view(1, heads, max_height_delta2, max_width_delta2).repeat(layers, 1, 1, 1) 
-
-#         self.triu_mask = torch.triu(torch.ones(12288, 12288, device=device, dtype=torch.bool), diagonal=1)
-#         # State variables
-#         self.rows = None
-#         self.cols = None
-#         self.lengths = None
-        
-#         # Cache for computed indices
-#         self.cached_indices = None
-        
-#         # Cache for masks
-#         self.sp_mask = None
-#         self.causal = None
-#         self.heads = heads
-#         self.device = device
-
-#     @staticmethod
-#     def _attention_init(heads, max_height, max_width, start_std=0.5, end_std=15, is_centered=False, device='cuda'):
-#         """init with a 2D multivariate normal pdf pattern."""
-#         # Create log-linear spaced std values between start_std and end_std
-#         std = start_std * (end_std/start_std) ** (torch.arange(heads, device=device).float() / (heads - 1)).view(heads, 1, 1)
-        
-#         # Create coordinate grid
-#         y_coords = torch.arange(max_height, device=device).float().view(1, max_height, 1)
-#         x_coords = torch.arange(max_width, device=device).float().view(1, 1, max_width)
-        
-#         if is_centered:
-#             center_h = max_height // 2
-#             center_w = max_width // 2
-#             squared_dist = ((y_coords - center_h) ** 2) + ((x_coords - center_w) ** 2)
-#         else:
-#             # Calculate distance from (0,0)
-#             squared_dist = (y_coords ** 2) + (x_coords ** 2)
-            
-#         # Apply 2D normal distribution formula (without normalization constant)
-#         pattern = torch.exp(-squared_dist / (2 * std ** 2))
-        
-#         return pattern
-    
-#     def set_indices(self, rows, cols, lengths):
-#         """Set the row, column indices and lengths for attention computation."""
-#         self.rows = rows
-#         self.cols = cols
-#         self.lengths = lengths
-        
-#         # Compute and cache indices
-#         del self.cached_indices
-#         self._compute_indices()
-        
-#         # Compute and cache masks
-#         self._compute_masks()
-#         # Create attention tensor once
-#         self.attn = torch.zeros((1, self.heads, rows.shape[0], rows.shape[0]), device=self.device, dtype=torch.bfloat16)
-    
-#     def _compute_masks(self):
-#         """Precompute special token mask and causal mask."""
-#         L = self.rows.shape[0]
-#         device = self.rows.device
-        
-#         # Special token mask
-#         special = (self.rows == 0)  # (L,)
-#         self.sp_mask = special.unsqueeze(0) | special.unsqueeze(1)  # (L,L)
-        
-#         # Causal mask
-#         self.causal = self.triu_mask[:L, :L]
-    
-#     def _compute_indices(self):
-#         """Precompute all indices needed for attention computation."""
-#         mh1, mw1 = self.within_grid_attn_bias.shape[2:]
-#         mh2, mw2 = self.across_grid_attn_bias.shape[2:]
-        
-#         # Precompute centers for across
-#         hc2 = (mh2 - 1) // 2
-#         wc2 = (mw2 - 1) // 2
-        
-#         indices = {}
-#         cur = 0
-#         Npairs = len(self.lengths)//2
-#         has_tail = (len(self.lengths) % 2 == 1)
-        
-#         for i in range(Npairs):
-#             lx, ly = self.lengths[2*i], self.lengths[2*i+1]
-#             xs, xe = cur, cur + lx
-#             ys, ye = xe, xe + ly
-            
-#             x_rows, x_cols = self.rows[xs:xe], self.cols[xs:xe]
-#             y_rows, y_cols = self.rows[ys:ye], self.cols[ys:ye]
-            
-#             # Within x→x indices
-#             hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
-#             wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
-#             indices[f'x2x_{i}'] = (hdx, wdx, xs, xe)
-            
-#             # Within y→y indices
-#             hdy = torch.clamp(y_rows.unsqueeze(0) - y_rows.unsqueeze(1), 0, mh1-1)
-#             wdy = torch.clamp(y_cols.unsqueeze(0) - y_cols.unsqueeze(1), 0, mw1-1)
-#             indices[f'y2y_{i}'] = (hdy, wdy, ys, ye)
-            
-#             # Across y→x indices
-#             hdxy = (y_rows.unsqueeze(1) - x_rows.unsqueeze(0)) + hc2
-#             wdxy = (y_cols.unsqueeze(1) - x_cols.unsqueeze(0)) + wc2
-#             hdxy = torch.clamp(hdxy, 0, mh2-1)
-#             wdxy = torch.clamp(wdxy, 0, mw2-1)
-#             indices[f'y2x_{i}'] = (hdxy, wdxy, ys, ye, xs, xe)
-            
-#             cur = ye
-            
-#         if has_tail:
-#             lx = self.lengths[-1]
-#             xs, xe = cur, cur + lx
-#             x_rows, x_cols = self.rows[xs:xe], self.cols[xs:xe]
-#             hdx = torch.clamp(x_rows.unsqueeze(0) - x_rows.unsqueeze(1), 0, mh1-1)
-#             wdx = torch.clamp(x_cols.unsqueeze(0) - x_cols.unsqueeze(1), 0, mw1-1)
-#             indices['tail'] = (hdx, wdx, xs, xe)
-            
-#         self.cached_indices = indices
-
-#     def forward(self, layer_idx):
-#         # rows, cols, lengths are already stored as tensors / python list
-#         return _MultiGridAttn.apply(
-#             self.within_grid_attn_bias,
-#             self.across_grid_attn_bias,
-#             self.lengths, layer_idx,
-#             self.cached_indices,
-#             self.sp_mask,
-#             self.causal,
-#             self.attn
-#         )
-
-# def apply_rotary_pos_emb(q, k, cos_expanded, sin_expanded, cos, sin, position_ids=None, unsqueeze_dim=1):
-#     """Applies Rotary Position Embedding to the query and key tensors.
-
-#     Args:
-#         q (`torch.Tensor`): The query tensor.
-#         k (`torch.Tensor`): The key tensor.
-#         cos (`torch.Tensor`): The cosine part of the rotary embedding.
-#         sin (`torch.Tensor`): The sine part of the rotary embedding.
-#         position_ids (`torch.Tensor`, *optional*):
-#             Deprecated and unused.
-#         unsqueeze_dim (`int`, *optional*, defaults to 1):
-#             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-#             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-#             that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-#             k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-#             cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-#             the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-#     Returns:
-#         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-#     """
-
-#     # cos = cos.unsqueeze(unsqueeze_dim)
-#     # sin = sin.unsqueeze(unsqueeze_dim)
-#     # cos (1, 8, seq_len, head_dim) -> repeat to (1, 32, seq_len, head_dim)
-#     q_embed = (q * cos_expanded) + (rotate_half(q) * sin_expanded)
-#     k_embed = (k * cos) + (rotate_half(k) * sin)
-#     return q_embed, k_embed
-    
-# class Qwen3RotaryEmbedding2d(nn.Module):
-#     def __init__(self, config: Qwen3Config, max_head_freq=100, device=None):
-#         super().__init__()
-#         # BC: "rope_type" was originally "type"
-#         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-#             self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
-#         else:
-#             self.rope_type = "default"
-#         self.max_seq_len_cached = config.max_position_embeddings
-#         self.original_max_seq_len = config.max_position_embeddings
-
-#         self.config = config
-#         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-#         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-#         mask = torch.arange(len(inv_freq)) % 2 == 0
-#         freq_x = inv_freq.clone()
-#         freq_y = inv_freq.clone()
-#         freq_x[~mask] = 0.0
-#         freq_y[mask] = 0.0
-
-#         # register as buffers so they move to the right device/dtype with the module
-#         self.register_buffer("freq_x", freq_x)  # (half_dim,)
-#         self.register_buffer("freq_y", freq_y)  # (half_dim,)
-
-#         # different freq for different heads, fast forward position as theta = 1000000, much bigger than seq_len
-#         self.head_freq = torch.linspace(1, max_head_freq, 8) # 8 groups for key,value
-
-#     @torch.no_grad()
-#     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-#     def forward(self, x, position_ids):
-#         rows, cols = position_ids # (seq_len)
-#         rows = rows[None, :, None].float() # (1, seq_len, 1)
-#         cols = cols[None, :, None].float() # (1, seq_len, 1)
-#         device_type = x.device.type
-#         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-#             freq_x = self.freq_x.float()[None, None, :].to(x.device) # (1, 1, half_dim)
-#             freq_y = self.freq_y.float()[None, None, :].to(x.device) # (1, 1, half_dim)
-#             angles = rows * freq_x + cols * freq_y # (1, seq_len, half_dim)
-#             emb = torch.cat((angles, angles), dim=-1)[:, None] # (1, 1, seq_len, hidden_dim)
-#             emb = self.head_freq[None,:, None, None].to(x.device) * emb # (1, heads, seq_len, hidden_dim)
-#             cos = emb.cos() * self.attention_scaling # (1, 8, seq_len, hidden_dim) for key, value
-#             sin = emb.sin() * self.attention_scaling
-#             cos_expanded = cos.repeat_interleave(4, dim=1)  # → (1,32,seq_len,dim) for query
-#             sin_expanded = sin.repeat_interleave(4, dim=1)  # → (1,32,seq_len,dim)
-#         return cos_expanded.to(dtype=x.dtype), sin_expanded.to(dtype=x.dtype), cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-    
-# def get_gemma_model(model_name, head_dim, isTrain, NeedPosition, saved_path=None, max_seq_length = 8192):
-#     model, _ = FastModel.from_pretrained(model_name = model_name,
-#                                          max_seq_length = max_seq_length,
-#                                          load_in_4bit = True,
-#                                          resize_model_vocab=head_dim,
-#                                         )
-#     try:
-#         del model.vision_tower
-#         model = model.base_model
-#     except:
-#         print("Not a vision language model")
-#     model.model.embed_tokens.padding_idx = None # otherwise token zero will be ignored
-#     if NeedPosition:
-#         embedding_layer = model.get_input_embeddings()
-#         PosEmbedModel = PositionalEmbedding2D(embedding_layer.weight.shape[1]).to(model.device)
-#         if saved_path is not None:
-#             PosEmbedModel.load_state_dict(torch.load(saved_path + 'PosEmbedModel.pth'))
-#         embedding_layer.register_forward_hook(PosEmbedModel);
-#     if isTrain:
-#         model.train();
-#         model.lm_head.weight.requires_grad_(True);
-#     gc.collect()
-#     torch.cuda.empty_cache()
-#     if saved_path is not None:
-#         model.lm_head.load_state_dict(torch.load(saved_path + 'lm_heads_weights.pth'))
-#         model = PeftModel.from_pretrained(model, saved_path + 'finetuned_model', is_trainable=isTrain)
-#     else:
-#         # start from pretrained model
-#         model.lm_head.load_state_dict(torch.load(f"/home/zhenlan/Desktop/Projects/ARC2/Model/gemma{head_dim}.pth"))
-#     if not isTrain:
-#         FastLanguageModel.for_inference(model);
-#     if NeedPosition:
-#         return model, PosEmbedModel
-#     else:
-#         return model
 
 '''  ----------------------------------- Dataset Transformation utilities ------------------------------------- '''
 @dataclass
@@ -954,6 +334,88 @@ def find_first_exceed(task, max_len, extra_tokens=4):
     return len(task)  # If total never exceeds max_len
 
 from features_optimized import extract_features, extract_causal_features
+def tokenize_features3(task, max_length, background_color,IsDecode=False, max_k=5, random_context=True):
+    # used for separate head for size prediction
+    BOS_X = 10  # Beginning of input grid
+    EOS_X = 11  # End of input grid
+    LINE_BREAK = 12  # Row separator
+    BOS_Y = 13  # Beginning of output grid
+    EOS_Y = 14  # End of output grid
+    INPUT_PLACEHOLDER = 15
+    input_tokens = []
+    sizes = [] # (l, 2), where l is the number of examples in task
+    length = [] # (len(input1), len(output1), ..., len(input_l))
+    features = []
+    # randomly sample how many tasks to use, various context length can help generalization
+    if random_context:
+        r = np.random.randint(2, len(task)+1)
+    else:
+        r = len(task)
+    n_task = min(find_first_exceed(task, max_length), r)
+    def get_token_from_grid(grid, bos_token, eos_token, placeholder_token, line_break_token):
+        n,m = len(grid), len(grid[0])
+        tokens = []
+        tokens.append(bos_token)
+        line = [placeholder_token] * len(grid[0])
+        line.append(line_break_token)
+        for _ in grid:
+            tokens.extend(line)
+        tokens.append(eos_token)
+        return tokens, [n-1, m-1] # -1 for 0-indexed for embedding
+    if IsDecode:
+        # For decoding, must include the last task
+        task = task[:n_task-1] + [task[-1]] 
+    else:
+        task = task[:n_task]
+    current_length = -1 # zero-indexed
+    for x, y in task[:n_task-1]:
+        # Extract features
+        input_feature = extract_features(x, max_k=max_k, background_color=background_color) # (l, d)
+        output_feature = extract_features(y, max_k=max_k, background_color=background_color)
+        rnd = np.random.rand()
+        l1, l2 = input_feature.shape[0], output_feature.shape[0]
+        features.append(np.concatenate([input_feature, np.zeros((l1,1)), np.ones((l1,1)) * rnd],1))
+        features.append(np.concatenate([output_feature, np.ones((l2,1)), np.ones((l2,1)) * rnd],1))        
+        # Tokenize input
+        token, size = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK)
+        input_tokens.extend(token)
+        sizes.append(size)
+        current_length += len(token)
+        length.append(current_length)
+        # Tokenize output
+        token, size = get_token_from_grid(y, BOS_Y, EOS_Y, INPUT_PLACEHOLDER, LINE_BREAK)
+        input_tokens.extend(token)
+        sizes.append(size)
+        current_length += len(token)
+        length.append(current_length)
+    # Tokenize last task
+    x, y = task[-1]
+    # Tokenize input
+    input_feature = extract_features(x, max_k=max_k, background_color=background_color) # (l, d)
+    rnd = np.random.rand()
+    l1 = input_feature.shape[0]
+    features.append(np.concatenate([input_feature, np.zeros((l1,1)), np.ones((l1,1)) * rnd],1))
+    token, size = get_token_from_grid(x, BOS_X, EOS_X, INPUT_PLACEHOLDER, LINE_BREAK)
+    input_tokens.extend(token)
+    sizes.append(size)
+    current_length += len(token)
+    length.append(current_length)
+    features = np.concatenate(features, axis=0)
+    sizes = np.stack(sizes, axis=0)
+    length = np.array(length)
+    target_tokens = []
+    if IsDecode:
+        # TODO: add size prediction
+        raise NotImplementedError
+    else:
+        row, col = len(y), len(y[0])
+        rows = [r for r in range(row) for _ in range(col)]
+        cols = [c for _ in range(row) for c in range(col)]
+        for flat_y in y:
+            target_tokens.extend(flat_y)
+        return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(rows), torch.tensor(cols),\
+               torch.tensor(sizes), torch.tensor(length), torch.tensor([row-1, col-1]) # -1 for 0-indexed for embedding
+    
 def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=5, random_context=True):
     # only use non-causal features and predict rows, cols, and cells in outputN in one-shot.
     BOS_X = 10  # Beginning of input grid
@@ -984,14 +446,14 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
         else:
             tokens = []
             targets = []
-        tokens.append(n + SIZE_OFFSET)
-        tokens.append(m + SIZE_OFFSET)
         tokens.append(bos_token)
         line = [placeholder_token] * len(grid[0])
         line.append(line_break_token)
         for _ in grid:
             tokens.extend(line)
         tokens.append(eos_token)
+        tokens.append(n + SIZE_OFFSET)
+        tokens.append(m + SIZE_OFFSET)
         targets.extend([PAD_TOKEN] * (len(tokens)- len(targets)))
         return tokens, targets
     if IsDecode:
