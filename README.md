@@ -117,3 +117,15 @@ class Qwen3RotaryEmbedding2d(nn.Module):
             sin_expanded = sin.repeat_interleave(4, dim=1)  # → (1,32,seq_len,dim)
         return cos_expanded.to(dtype=x.dtype), sin_expanded.to(dtype=x.dtype), cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 ```
+#### enriched feature
+- unlike token in NLP, cell value of 0 ~ 9 is not semantically meaningful by itself, its value is entirely dependent on the context.
+- hand crafted features are described in features.md and implemented in features_optimized.py. There are 2 versions of features, causal and non-causal, i.e., features dependent on
+current or prior cells in flattened grid or any cell in the grid. Only causal features can be used for autoregressive training, input features are non-causal.
+- extract_features takes in grid and background color (0) and returns a flattened feature vector of shape (n_pixels, n_features).
+- tokenize_features takes in a task (list of input and output grid) and returns a input_tokens (with placeholder for features injections), and features (total flattened sequence length, n_features). 
+input_tokens: BOS_X, placeholder_token * flattened sequence length, EOS_X, BOS_Y, placeholder_token * flattened sequence length, EOS_Y...
+- FeatureEmbedding is used to map features to embedding space and then injected into the placeholder_token in input_tokens for LLM to consume.
+
+#### Model Target
+- autoregressive on all (all causal) -> autoregressive on output (input non-causal, output causal) -> autoregressive on outputN / one-shot on outputN
+- less training signal as we autoregressively train on less target but with richer features. **one-shot on outputN does not work well and size prediction does not work well as shown in Fine_Tune copy 19**
