@@ -342,51 +342,21 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
                 
                 # 1. Count of each color in the causally visible part of k x k box
                 for color in range(10):
-                    if box_size > 0:
-                        count = np.sum((box == color) & box_mask)
-                        pixel_features.append(count / box_size)
-                    else:
-                        pixel_features.append(0.0)
+                    count = np.sum((box == color) & box_mask)
+                    pixel_features.append(count / box_size)
                 
                 # 2. Count of color in the box that is the same as the center pixel (normalized)
-                if box_size > 0:
-                    same_color_count = np.sum((box == center_color) & box_mask)
-                    pixel_features.append(same_color_count / box_size)
-                else:
-                    pixel_features.append(0.0)
+                same_color_count = np.sum((box == center_color) & box_mask)
+                pixel_features.append(same_color_count / box_size)
                 
                 # 5. Count of connected cells (4-ways and 8-ways) in causally visible k x k box
                 connected_4way = count_connected_cells_causal(grid_array, i, j, k, causal_mask, diagonal=False)
                 connected_8way = count_connected_cells_causal(grid_array, i, j, k, causal_mask, diagonal=True)
-                if box_size > 0:
-                    pixel_features.append(connected_4way / box_size)
-                    pixel_features.append(connected_8way / box_size)
-                else:
-                    pixel_features.append(0.0)
-                    pixel_features.append(0.0)
+                pixel_features.append(connected_4way / box_size)
+                pixel_features.append(connected_8way / box_size)
                 
-                # NEW: Symmetry features for causally visible k x k box
-                # We need to handle masked areas carefully when checking symmetry
-                # Use the part that's visible in causal mask for symmetry analysis
-                masked_box = np.where(box_mask, box, -1)  # Use -1 for masked areas
-                
-                # Standard symmetry features
-                h_sym = is_horizontally_symmetric(masked_box)
-                v_sym = is_vertically_symmetric(masked_box)
-                r_sym = is_rotationally_symmetric(masked_box)
-                pixel_features.append(float(h_sym))
-                pixel_features.append(float(v_sym))
-                pixel_features.append(float(r_sym))
-                
-                # Non-background symmetry features
-                binary_box = np.where(box_mask, (box != background_color).astype(int), -1)
-                h_sym_non_bg = is_horizontally_symmetric(binary_box)
-                v_sym_non_bg = is_vertically_symmetric(binary_box)
-                r_sym_non_bg = is_rotationally_symmetric(binary_box)
-                pixel_features.append(float(h_sym_non_bg))
-                pixel_features.append(float(v_sym_non_bg))
-                pixel_features.append(float(r_sym_non_bg))
-            
+                # NEW: Symmetry features does not make sense for causally visible k x k box
+
             # K-independent features (computed once)
             
             # 3. Row and Column Indices normalized
@@ -400,12 +370,8 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
             # 6. Count of connected cells in the causal part of the whole grid
             connected_4way_grid = count_connected_cells_causal(grid_array, i, j, max(height, width), causal_mask, diagonal=False)
             connected_8way_grid = count_connected_cells_causal(grid_array, i, j, max(height, width), causal_mask, diagonal=True)
-            if causal_grid_total_pixels > 0:
-                pixel_features.append(connected_4way_grid / causal_grid_total_pixels)
-                pixel_features.append(connected_8way_grid / causal_grid_total_pixels)
-            else:
-                pixel_features.append(0.0)
-                pixel_features.append(0.0)
+            pixel_features.append(connected_4way_grid / causal_grid_total_pixels)
+            pixel_features.append(connected_8way_grid / causal_grid_total_pixels)
             
             # 7. Count of color in causally visible part of row and column
             row_counts = np.zeros(10)
@@ -414,10 +380,8 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
                 row_visible = np.sum(causal_mask[i, :])
                 col_visible = np.sum(causal_mask[:, j])
                 
-                if row_visible > 0:
-                    row_counts[color] = np.sum((grid_array[i, :] == color) & causal_mask[i, :]) / row_visible
-                if col_visible > 0:
-                    col_counts[color] = np.sum((grid_array[:, j] == color) & causal_mask[:, j]) / col_visible
+                row_counts[color] = np.sum((grid_array[i, :] == color) & causal_mask[i, :]) / row_visible
+                col_counts[color] = np.sum((grid_array[:, j] == color) & causal_mask[:, j]) / col_visible
             
             pixel_features.extend(row_counts)
             pixel_features.extend(col_counts)
@@ -429,19 +393,12 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
             row_visible = np.sum(causal_mask[i, :])
             col_visible = np.sum(causal_mask[:, j])
             
-            if row_visible > 0:
-                pixel_features.append(row_connected / row_visible)
-                pixel_features.append(col_connected / col_visible)
-            else:
-                pixel_features.append(0.0)
-                pixel_features.append(0.0)
+            pixel_features.append(row_connected / row_visible)
+            pixel_features.append(col_connected / col_visible)
             
             # 9. Count of each color in the causally visible part of the grid
             for color in range(10):
-                if causal_grid_total_pixels > 0:
-                    pixel_features.append(causal_grid_color_counts[color] / causal_grid_total_pixels)
-                else:
-                    pixel_features.append(0.0)
+                pixel_features.append(causal_grid_color_counts[color] / causal_grid_total_pixels)
             
             # 14. Is the cell on the grid border
             is_border = (i == 0 or j == 0)  # Only top and left borders are causal
@@ -701,14 +658,14 @@ def has_bounding_box(grid, center_i, center_j, distance):
 
 
 
-def test_causality_constraint(grid, max_k: int = 5):
+def test_causality_constraint(grid, max_k: int = 5, background_color: int = 0):
     """
     Tests that modifying grid[i,j] only causes differences in features
     with row-column order >= (i,j) (flatten index >= i*width + j).
     """
     grid = np.array(grid)
     h, w = grid.shape
-    orig_features = extract_causal_features(grid.tolist(), max_k=max_k)
+    orig_features = extract_causal_features(grid.tolist(), background_color=background_color, max_k=max_k)
     tot = h * w
     idx = 0
     for i in range(h):
@@ -717,11 +674,13 @@ def test_causality_constraint(grid, max_k: int = 5):
             # Flip the value in a deterministic way (must be different from original)
             modified_grid[i, j] = (grid[i, j] + 1) % 10
 
-            new_features = extract_causal_features(modified_grid.tolist(), max_k=max_k)
+            new_features = extract_causal_features(modified_grid.tolist(), background_color=background_color, max_k=max_k)
 
             # Compare
             diff_locs = np.where(np.any(orig_features != new_features, axis=1))[0]
-            if np.any(diff_locs != np.arange(idx, tot)):
+            if diff_locs.shape[0] != tot - idx or np.any(diff_locs != np.arange(idx, tot)):
+                print(f"diff_locs: {diff_locs}")
+                print(f"idx: {idx}")
                 raise ValueError(f"Causality constraint violated at {i}, {j}")
             idx += 1
 
