@@ -107,7 +107,7 @@ class FeatureEmbedding2(nn.Module):
         d = config.hidden_size
         self.features_MLP = torch.nn.Sequential(torch.nn.Linear(input_dim,hidden_dim1),torch.nn.SiLU(),torch.nn.Linear(hidden_dim1,d))
         self.cos_sin_MLP = torch.nn.Sequential(torch.nn.Linear(d,hidden_dim2),torch.nn.SiLU(),torch.nn.Linear(hidden_dim2,d))
-        self.cos_sin_embedding = CosSinEmbedding(dim=d)
+        self.cos_sin_embedding = CosSinEmbedding(dim=d) # for decoding, position embedding
         self.dropout = nn.Dropout(dropout)
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -121,7 +121,7 @@ class FeatureEmbedding2(nn.Module):
         return embed_features
     
 class FeatureEmbedding(nn.Module):
-    def __init__(self, embed_model, config, input_dim=94, output_dim=74):
+    def __init__(self, embed_model, config, input_dim=162, output_dim=133, dropout=0.17):
         super().__init__()
         self.embed_model = embed_model
         self.config = config
@@ -129,14 +129,16 @@ class FeatureEmbedding(nn.Module):
         self.input_features_MLP = torch.nn.Sequential(torch.nn.Linear(input_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d))
         self.output_features_MLP = torch.nn.Sequential(torch.nn.Linear(output_dim,d),torch.nn.SiLU(),torch.nn.Linear(d,d))
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, input_features, output_features, input_tokens):
         input_features = self.input_features_MLP(input_features)
         output_features = self.output_features_MLP(output_features)
         embed_features = self.embed_model(input_tokens)
-        embed_features = embed_features.masked_scatter((input_tokens==6)[...,None], input_features)
-        embed_features = embed_features.masked_scatter((input_tokens==7)[...,None], output_features)
+        embed_features = embed_features.masked_scatter((input_tokens==15)[...,None], input_features)
+        embed_features = embed_features.masked_scatter((input_tokens==16)[...,None], output_features)
         embed_features = self.norm(embed_features)
+        embed_features = self.dropout(embed_features)
         return embed_features
 
 '''  ----------------------------------- Dataset Transformation utilities ------------------------------------- '''
@@ -414,15 +416,14 @@ def tokenize_features2(task, max_length, background_color,IsDecode=False, max_k=
             target_tokens.extend(flat_y)
         return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(features, dtype=torch.bfloat16), torch.tensor(rows), torch.tensor(cols)
 
-def tokenize_features(task, max_length, IsDecode=False, max_k=5, **kwargs):
-    # TODO: extract_causal_features needs to be updated as extract_features
+def tokenize_features(task, max_length, background_color,IsDecode=False, max_k=5):
     BOS_X = 10  # Beginning of input grid
     EOS_X = 11  # End of input grid
     LINE_BREAK = 12  # Row separator
     BOS_Y = 13  # Beginning of output grid
     EOS_Y = 14  # End of output grid
-    INPUT_PLACEHOLDER = 6
-    OUTPUT_PLACEHOLDER = 7
+    INPUT_PLACEHOLDER = 15
+    OUTPUT_PLACEHOLDER = 16
     PAD_TOKEN = -100  # Padding/ignored token
 
     input_tokens = []
@@ -456,8 +457,8 @@ def tokenize_features(task, max_length, IsDecode=False, max_k=5, **kwargs):
         task = task[:n_task]
     for x, y in task:
         # Extract features
-        input_feature = extract_features(x, max_k=max_k) # (l, d)
-        output_feature = extract_causal_features(y, max_k=max_k)
+        input_feature = extract_features(x, background_color, max_k) # (l, d)
+        output_feature = extract_causal_features(y, background_color, max_k)
         input_features.append(input_feature)
         output_features.append(output_feature)
         # Tokenize input and targets
