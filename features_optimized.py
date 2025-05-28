@@ -2,7 +2,7 @@ import numpy as np
 from typing import List, Tuple, Optional
 from scipy.ndimage import label
 
-def extract_features(grid: List[List[int]], background_color, max_k: int = 5) -> np.ndarray:
+def extract_features(grid: List[List[int]], max_k: int = 5) -> np.ndarray:
     """
     Extract features from a grid of integers (0-9).
     For k-dependent features, iterates over k = 3, 5, 7, ... max_k and concatenates results.
@@ -10,13 +10,14 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
     
     Args:
         grid: List of lists of integers between 0 and 9
-        background_color: Integer representing the background color (0-9)
         max_k: Maximum size of the box for local features (default: 5)
+        background_color: Integer representing the background color (default: 0)
     
     Returns:
         A numpy array of shape (n_pixels, n_features) containing the features for each pixel
     """
     # Convert grid to numpy array
+    background_color = 0
     grid_array = np.array(grid, dtype=int)
     height, width = grid_array.shape
     
@@ -285,7 +286,7 @@ def extract_features(grid: List[List[int]], background_color, max_k: int = 5) ->
     
     return np.array(features)
 
-def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_color: int = 0) -> np.ndarray:
+def extract_causal_features(grid: List[List[int]], max_k: int = 5) -> np.ndarray:
     """
     Extract features from a grid with causality constraint.
     Cell i,j can only depend on current row i with smaller or equal j and all previous rows.
@@ -301,6 +302,7 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
     """
     # TODO: extract_causal_features needs to be updated as extract_features
     # Convert grid to numpy array
+    background_color = 0
     grid_array = np.array(grid, dtype=int)
     height, width = grid_array.shape
     
@@ -314,7 +316,7 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
             
             # Get the center pixel color
             center_color = grid_array[i, j]
-            
+            pixel_features.append(float(background_color==center_color))
             # Create a causal mask for each position
             causal_mask = np.zeros_like(grid_array, dtype=bool)
             causal_mask[:i, :] = True  # All previous rows
@@ -355,6 +357,25 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
                 pixel_features.append(connected_4way / box_size)
                 pixel_features.append(connected_8way / box_size)
                 
+                # NEW: Add color distribution for non-background connected component in k x k box
+                # Only consider if center pixel is not background color
+                if center_color != background_color:
+                    # For 4-way connectivity, get color distribution for the connected component at center pixel
+                    box_non_bg_color_dist_4way = get_non_bg_component_color_dist_causal(
+                        grid_array, i, j, k, causal_mask, background_color, diagonal=False)
+                    
+                    # For 8-way connectivity, get color distribution for the connected component at center pixel
+                    box_non_bg_color_dist_8way = get_non_bg_component_color_dist_causal(
+                        grid_array, i, j, k, causal_mask, background_color, diagonal=True)
+                else:
+                    # Center pixel is background color, so no non-background component
+                    box_non_bg_color_dist_4way = np.zeros(10)
+                    box_non_bg_color_dist_8way = np.zeros(10)
+                
+                # Add color distribution for non-background component in k x k box
+                pixel_features.extend(box_non_bg_color_dist_4way)
+                pixel_features.extend(box_non_bg_color_dist_8way)
+
                 # NEW: Symmetry features does not make sense for causally visible k x k box
 
             # K-independent features (computed once)
@@ -372,6 +393,25 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
             connected_8way_grid = count_connected_cells_causal(grid_array, i, j, max(height, width), causal_mask, diagonal=True)
             pixel_features.append(connected_4way_grid / causal_grid_total_pixels)
             pixel_features.append(connected_8way_grid / causal_grid_total_pixels)
+            
+            # NEW: Add color distribution for non-background connected component in the entire grid
+            # Only consider if center pixel is not background color
+            if center_color != background_color:
+                # For 4-way connectivity, get color distribution for the connected component at center pixel
+                grid_non_bg_color_dist_4way = get_non_bg_component_color_dist_causal(
+                    grid_array, i, j, max(height, width), causal_mask, background_color, diagonal=False)
+                
+                # For 8-way connectivity, get color distribution for the connected component at center pixel
+                grid_non_bg_color_dist_8way = get_non_bg_component_color_dist_causal(
+                    grid_array, i, j, max(height, width), causal_mask, background_color, diagonal=True)
+            else:
+                # Center pixel is background color, so no non-background component
+                grid_non_bg_color_dist_4way = np.zeros(10)
+                grid_non_bg_color_dist_8way = np.zeros(10)
+            
+            # Add color distribution for non-background component in the entire grid
+            pixel_features.extend(grid_non_bg_color_dist_4way)
+            pixel_features.extend(grid_non_bg_color_dist_8way)
             
             # 7. Count of color in causally visible part of row and column
             row_counts = np.zeros(10)
@@ -400,17 +440,63 @@ def extract_causal_features(grid: List[List[int]], max_k: int = 5, background_co
             for color in range(10):
                 pixel_features.append(causal_grid_color_counts[color] / causal_grid_total_pixels)
             
-            # 14. Is the cell on the grid border
-            is_border = (i == 0 or j == 0)  # Only top and left borders are causal
-            pixel_features.append(float(is_border))
-            
-            # 15. Is the cell in a corner of the grid
-            is_corner = (i == 0 and j == 0)  # Only top-left corner is causal
-            pixel_features.append(float(is_corner))
-            
             features.append(pixel_features)
     
     return np.array(features)
+
+def get_non_bg_component_color_dist_causal(grid, center_i, center_j, k, causal_mask, background_color, diagonal=False):
+    """
+    Get the color distribution for the non-background connected component containing
+    the center pixel, respecting causal constraints.
+    
+    Args:
+        grid: The grid array
+        center_i, center_j: Center position coordinates
+        k: Size of the box around the center
+        causal_mask: Mask indicating which cells are causally visible
+        background_color: The background color to exclude
+        diagonal: Whether to include diagonal connections (8-way) or not (4-way)
+    
+    Returns:
+        Array of normalized color counts (10 elements for colors 0-9)
+    """
+    height, width = grid.shape
+    center_color = grid[center_i, center_j]
+    
+    # Define the box
+    box_start_i = max(0, center_i - k // 2)
+    box_end_i = min(height, center_i + k // 2 + 1)
+    box_start_j = max(0, center_j - k // 2)
+    box_end_j = min(width, center_j + k // 2 + 1)
+    
+    # Box and corresponding mask
+    box = grid[box_start_i:box_end_i, box_start_j:box_end_j]
+    mask_box = causal_mask[box_start_i:box_end_i, box_start_j:box_end_j]
+    
+    # Create a mask for non-background pixels in the box that are causally visible
+    non_bg_mask = (box != background_color) & mask_box
+    
+    # Label the connected components in the box
+    structure = np.ones((3,3), dtype=bool) if diagonal else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=bool)
+    labeled, _ = label(non_bg_mask, structure=structure)
+    
+    # Find the label at the center position
+    ci, cj = center_i - box_start_i, center_j - box_start_j
+    center_label = labeled[ci, cj]
+    
+    # Create mask for the connected component containing the center pixel
+    component_mask = (labeled == center_label)
+    
+    # Count colors in this component
+    color_counts = np.zeros(10)
+    for color in range(10):
+        color_counts[color] = np.sum((box == color) & component_mask)
+    
+    # Normalize by total pixels in causal mask
+    total_causal_pixels = np.sum(causal_mask)
+    normalized_color_counts = color_counts / total_causal_pixels
+    
+    return normalized_color_counts
 
 def count_connected_cells_causal(grid, center_i, center_j, k, causal_mask, diagonal=False):
     """Count connected cells of the same color in a k x k box, within the causal mask, using scipy."""
