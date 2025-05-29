@@ -82,7 +82,39 @@ class GlobalConfig:
             data = json.load(json_file)
         return cls(**data)
     
-class CosSinEmbedding(nn.Module):
+class CosSinEmbedding1D(nn.Module):
+    def __init__(self, dim=4096, theta=30):
+        super().__init__()
+        # For 1D embedding, theta represents the max_len (similar to 2D version)
+        # Create frequency tensor for half the dimensions
+        half_dim = dim // 2
+        freq = 1.0 / (theta ** (torch.arange(0, half_dim) / half_dim)).float()
+        
+        # Pre-compute cosine and sine for all positions up to theta (max_len)
+        pos = torch.arange(0, theta)[:, None].float()  # (theta, 1)
+        pos_freq = pos * freq[None, :]  # (theta, half_dim)
+        
+        # Compute cosine and sine
+        cos_embed = torch.cos(pos_freq)  # (theta, half_dim)
+        sin_embed = torch.sin(pos_freq)  # (theta, half_dim)
+        
+        cos_sin = torch.cat([cos_embed, sin_embed], dim=-1)  # (theta, dim)
+        self.register_buffer('cos_sin', cos_sin)
+        
+    def forward(self, positions):
+        """
+        Args:
+            positions: Tensor of shape (L,) containing position indices
+        Returns:
+            Tensor of shape (1, L, dim) containing cosine and sine embeddings
+        """
+            
+        # Look up pre-computed cosine and sine values
+        embeddings = self.cos_sin[positions]  # (L, dim)
+        
+        return embeddings.unsqueeze(0)  # (1, L, dim)
+
+class CosSinEmbedding2d(nn.Module):
     def __init__(self, dim=4096, theta = 30):
         super().__init__()
         freq = 1.0 / (theta ** (torch.arange(0, dim, 4) / dim))[None,:].float()
@@ -95,9 +127,43 @@ class CosSinEmbedding(nn.Module):
 
     def forward(self, rows, cols):
         # rows and cols are the row / col index of shape (L) for the flattened grid
-        rows_cos_sin = self.cos_sin[rows[0]]
-        cols_cos_sin = self.cos_sin[cols[0]]
+        if rows.ndim == 2:
+            rows_cos_sin = self.cos_sin[rows[0]]
+            cols_cos_sin = self.cos_sin[cols[0]]
+        else:
+            rows_cos_sin = self.cos_sin[rows]
+            cols_cos_sin = self.cos_sin[cols]
         return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
+
+class CombinedEmbedding(nn.Module):
+    def __init__(self, token_embedding_model, dim=4096, hidden_example=64, hidden_position=128, theta_1d=30, theta_2d=31, dropout=0.1):
+        super().__init__()
+        self.token_embedding_model = token_embedding_model
+        self.example_embedding_model = CosSinEmbedding1D(dim=dim, theta=theta_1d)
+        self.example_MLP = torch.nn.Sequential(
+            torch.nn.Linear(dim, hidden_example),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_example, dim)
+        )
+        self.position_MLP = torch.nn.Sequential(
+            torch.nn.Linear(dim, hidden_position),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_position, dim)
+        )
+        self.in_out_id_model = torch.nn.Embedding(2, dim)
+        self.position_embedding_model = CosSinEmbedding2d(theta=theta_2d)
+        # self.norm = Qwen3RMSNorm(dim)
+        # self.dropout = nn.Dropout(dropout)
+
+    def forward(self, inputs):
+        token_embedding = self.token_embedding_model(inputs['input_tokens'])
+        example_embedding = self.example_MLP(self.example_embedding_model(inputs['example_ids']))
+        in_out_embedding = self.in_out_id_model(inputs['in_out_ids'])[None]
+        pos_embedding = self.position_MLP(self.position_embedding_model(inputs['row_indices'], inputs['col_indices']))
+        combined_embedding = token_embedding + example_embedding + in_out_embedding + pos_embedding
+        # combined_embedding = self.norm(combined_embedding)
+        # combined_embedding = self.dropout(combined_embedding)
+        return combined_embedding
     
 class FeatureEmbedding2(nn.Module):
     def __init__(self, embed_model, config, input_dim=164, hidden_dim1=4096, hidden_dim2=128, dropout=0.17):
@@ -107,7 +173,7 @@ class FeatureEmbedding2(nn.Module):
         d = config.hidden_size
         self.features_MLP = torch.nn.Sequential(torch.nn.Linear(input_dim,hidden_dim1),torch.nn.SiLU(),torch.nn.Linear(hidden_dim1,d))
         self.cos_sin_MLP = torch.nn.Sequential(torch.nn.Linear(d,hidden_dim2),torch.nn.SiLU(),torch.nn.Linear(hidden_dim2,d))
-        self.cos_sin_embedding = CosSinEmbedding(dim=d) # for decoding, position embedding
+        self.cos_sin_embedding = CosSinEmbedding2d(dim=d) # for decoding, position embedding
         self.dropout = nn.Dropout(dropout)
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -478,7 +544,7 @@ def tokenize_features(task, max_length, IsDecode=False, max_k=5):
     return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(input_features, dtype=torch.bfloat16), torch.tensor(output_features, dtype=torch.bfloat16)
     
 
-def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False):
+def tokenize_causal(task, max_length, IsDecode=False):
     """
     Tokenizes a task for causal (autoregressive) training or inference,
     providing 2D positional indices using optimized list extensions.
@@ -506,6 +572,11 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False):
     LINE_BREAK = 12  # Row separator
     BOS_Y = 13  # Beginning of output grid
     EOS_Y = 14  # End of output grid
+    PREDICT_ROW = 15
+    PREDICT_COL = 16
+    PREDICT_CELL = 17 # for one-shot prediction, not used in initial training
+    OFFSET = 17
+    # 18 - 47 are for size prediction
     PAD_TOKEN = -100  # Padding/ignored token
 
     input_tokens = []
@@ -515,7 +586,6 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False):
     example_ids = []
     in_out_ids = []
     
-    flag = not IsDecode and not autoregressive
     n_task = find_first_exceed(task, max_length)
     if IsDecode:
         # For decoding, must include the last task
@@ -524,23 +594,22 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False):
         task = task[:n_task]
     n = len(task)
     global_r, global_c = 1, 1  # special token has (0,0). So we start from 1 to differentiate special token.
-    
+    example_permutation = np.random.permutation(30)
     for i, (x, y) in enumerate(task):
         IsLast = (i == n-1) and IsDecode
         
         # Process input grid (x)
+        target = []
         input_start_len = len(input_tokens)
         input_tokens.append(BOS_X)
-        if flag:
-            target_tokens.append(PAD_TOKEN)
+        target.append(PAD_TOKEN)
         row_indices.append(0)
         col_indices.append(0)
             
         for r_idx, row in enumerate(x):
             # Add row elements
             input_tokens.extend(row)
-            if flag:
-                target_tokens.extend([PAD_TOKEN]*len(row))
+            target.extend(row)
             row_len = len(row)
             row_indices.extend([r_idx + global_r] * row_len)
             col_indices.extend(list(range(global_c, row_len + global_c)))
@@ -548,34 +617,37 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False):
             input_tokens.append(LINE_BREAK)
             row_indices.append(r_idx + global_r + 1)
             col_indices.append(0)
-            if flag:
-                target_tokens.append(PAD_TOKEN)
+            target.append(LINE_BREAK)
 
         input_tokens.append(EOS_X)
-        if flag:
-            target_tokens.append(PAD_TOKEN)
-        row_indices.append(0)
-        col_indices.append(0)
-        
+        target.append(EOS_X)
+        row_indices.extend([0, 0, 0])
+        col_indices.extend([0, 0, 0])
+        n,m = len(x), len(x[0])
+        input_tokens.extend([OFFSET+n, OFFSET+m])
+        target.extend([PAD_TOKEN, PAD_TOKEN])
+
         # Extend example_ids and in_out_ids for entire input grid
         input_end_len = len(input_tokens)
-        example_ids.extend([i] * (input_end_len - input_start_len))
+        example_ids.extend([example_permutation[i]] * (input_end_len - input_start_len))
         in_out_ids.extend([0] * (input_end_len - input_start_len))  # 0 for input
-
+        
+        target.append(PAD_TOKEN)
+        target_tokens.extend(target[1:]) # shift by 1 for autoregressive target
+        
         # Process output grid (y)
         output_start_len = len(input_tokens)
-        input_tokens.append(BOS_Y)
-        if flag:
-            target_tokens.append(PAD_TOKEN)  # Mask BOS_Y
-        row_indices.append(0)
-        col_indices.append(0)
+        n,m = len(y), len(y[0])
+        target = [PAD_TOKEN, n-1, m-1] # 0-indexed size prediction, logit[:, :, 18:] 18 <-> 0, 19 <-> 1,...
+        input_tokens.extend([PREDICT_ROW, PREDICT_COL, BOS_Y])
+        row_indices.extend([0, 0, 0])
+        col_indices.extend([0, 0, 0])
 
         if not IsLast:
             for r_idx, row in enumerate(y):
                 # Add row elements
                 input_tokens.extend(row)
-                if flag:
-                    target_tokens.extend(row)  # Keep y values in target
+                target.extend(row)  # Keep y values in target
                 # Extend position indices for the row
                 row_len = len(row)
                 row_indices.extend([r_idx + global_r] * row_len)
@@ -584,28 +656,21 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False):
                 input_tokens.append(LINE_BREAK)
                 row_indices.append(r_idx + global_r + 1)
                 col_indices.append(0)                
-                if flag:
-                    target_tokens.append(LINE_BREAK)
+                target.append(LINE_BREAK)
 
             input_tokens.append(EOS_Y)
             row_indices.append(0)
             col_indices.append(0)
-            if flag:
-                target_tokens.append(EOS_Y)  # Include EOS_Y in target
+            target.append(EOS_Y)  # Include EOS_Y in target
                 
             # Extend example_ids and in_out_ids for entire output grid
             output_end_len = len(input_tokens)
-            example_ids.extend([i] * (output_end_len - output_start_len))
+            example_ids.extend([example_permutation[i]] * (output_end_len - output_start_len))
             in_out_ids.extend([1] * (output_end_len - output_start_len))  # 1 for output
+            target.append(PAD_TOKEN)
+            target_tokens.extend(target[1:]) # shift by 1 for autoregressive target
         else:
             target_tokens = y  # For the last example in decode mode
-        
-    # Create shifted targets (for next-token prediction)
-    if not IsDecode:
-        if autoregressive:
-            target_tokens = input_tokens[1:] + [PAD_TOKEN]
-        else:
-            target_tokens = target_tokens[1:] + [PAD_TOKEN]
     # Convert to numpy arrays
     out = dict()
     out["input_tokens"] = numpy2torch(input_tokens)
