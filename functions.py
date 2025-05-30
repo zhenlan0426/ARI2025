@@ -136,15 +136,10 @@ class CosSinEmbedding2d(nn.Module):
         return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
 
 class CombinedEmbedding(nn.Module):
-    def __init__(self, token_embedding_model, dim=4096, hidden_example=64, hidden_position=128, theta_1d=30, theta_2d=31, dropout=0.1):
+    def __init__(self, token_embedding_model, dim=4096, hidden_position=128, theta_1d=30, theta_2d=31):
         super().__init__()
         self.token_embedding_model = token_embedding_model
-        self.example_embedding_model = CosSinEmbedding1D(dim=dim, theta=theta_1d)
-        self.example_MLP = torch.nn.Sequential(
-            torch.nn.Linear(dim, hidden_example),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden_example, dim)
-        )
+        self.example_embedding_model = torch.nn.Embedding(theta_1d, dim)
         self.position_MLP = torch.nn.Sequential(
             torch.nn.Linear(dim, hidden_position),
             torch.nn.SiLU(),
@@ -152,15 +147,17 @@ class CombinedEmbedding(nn.Module):
         )
         self.in_out_id_model = torch.nn.Embedding(2, dim)
         self.position_embedding_model = CosSinEmbedding2d(theta=theta_2d)
+        self.example_embedding_model.weight.data.normal_(0, 0.01)
+        self.in_out_id_model.weight.data.normal_(0, 0.01)
         # self.norm = Qwen3RMSNorm(dim)
         # self.dropout = nn.Dropout(dropout)
 
     def forward(self, inputs):
         token_embedding = self.token_embedding_model(inputs['input_tokens'])
-        example_embedding = self.example_MLP(self.example_embedding_model(inputs['example_ids']))
+        example_embedding = self.example_embedding_model(inputs['example_ids'])
         in_out_embedding = self.in_out_id_model(inputs['in_out_ids'])[None]
         pos_embedding = self.position_MLP(self.position_embedding_model(inputs['row_indices'], inputs['col_indices']))
-        combined_embedding = token_embedding + example_embedding + in_out_embedding + pos_embedding
+        combined_embedding = token_embedding + example_embedding + in_out_embedding + pos_embedding/13 # to ensure the scale is similar at initialization
         # combined_embedding = self.norm(combined_embedding)
         # combined_embedding = self.dropout(combined_embedding)
         return combined_embedding
@@ -542,12 +539,10 @@ def tokenize_features(task, max_length, IsDecode=False, max_k=5):
     input_features = np.concatenate(input_features, axis=0)
     output_features = np.concatenate(output_features, axis=0)
     return torch.tensor(input_tokens), torch.tensor(target_tokens), torch.tensor(input_features, dtype=torch.bfloat16), torch.tensor(output_features, dtype=torch.bfloat16)
-    
-
-def tokenize_causal(task, max_length, IsDecode=False):
+def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, NeedPosition: bool = False, ReturnLengths: bool = False, offset1: int = 0, offset2: int = 0, background_color: int = 0):
     """
     Tokenizes a task for causal (autoregressive) training or inference,
-    providing 2D positional indices using optimized list extensions.
+    optionally providing 2D positional indices using optimized list extensions.
 
     Args:
         task: List of (input_grid, output_grid) tuples.
@@ -556,15 +551,200 @@ def tokenize_causal(task, max_length, IsDecode=False):
         autoregressive: Whether to use autoregressive training mode.
         max_length: Maximum sequence length for truncation.
         IsDecode: Whether the function is being used for inference (True) or training (False).
+        NeedPosition: If True, return row and column indices for 2D position embedding.
+        ReturnLengths: If True, return a list of lengths for each input and output grid.
 
     Returns:
-        Dictionary containing:
-        - "input_tokens": Numpy array of input token IDs.
-        - "target_tokens": Same as above.
-        - "row_indices": Numpy array of row indices.
-        - "col_indices": Numpy array of column indices.
-        - "example_ids": Numpy array of example indices (0-indexed).
-        - "in_out_ids": Numpy array of input/output indicators (0=input, 1=output).
+        If NeedPosition is False and ReturnLengths is False:
+            input_tokens: Numpy array of input token IDs.
+            final_target: Numpy array of shifted target token IDs (training) or raw grid (decoding).
+        If NeedPosition is True or ReturnLengths is True:
+            Dictionary containing requested outputs:
+            - "input_tokens": Numpy array of input token IDs.
+            - "target_tokens": Same as above.
+            - "row_indices": Numpy array of row indices (if NeedPosition is True).
+            - "col_indices": Numpy array of column indices (if NeedPosition is True).
+            - "lengths": List of lengths for each input and output grid (if ReturnLengths is True).
+    """
+    # Special token IDs
+    BOS_X = 10  # Beginning of input grid
+    EOS_X = 11  # End of input grid
+    LINE_BREAK = 12  # Row separator
+    BOS_Y = 13  # Beginning of output grid
+    EOS_Y = 14  # End of output grid
+    PAD_TOKEN = -100  # Padding/ignored token
+
+    input_tokens = []
+    target_tokens = []
+    if NeedPosition:
+        row_indices = []
+        col_indices = []
+    if ReturnLengths:
+        lengths = []
+    
+    flag = not IsDecode and not autoregressive
+    n_task = find_first_exceed(task, max_length)
+    if IsDecode:
+        # For decoding, must include the last task
+        task = task[:n_task-1] + [task[-1]] 
+    else:
+        task = task[:n_task]
+    n = len(task)
+    if offset2 == 0:
+        global_r, global_c = 1, 1
+    else:
+        global_r, global_c = offset2, offset2 # special token has (0,0). So we start from offset2 to differentiate special token.
+    for i, (x, y) in enumerate(task):
+        IsLast = (i == n-1) and IsDecode
+        
+        # Track starting position for length calculation
+        if ReturnLengths:
+            input_start_pos = len(input_tokens)
+        
+        # Process input grid (x)
+        input_tokens.append(BOS_X)
+        if flag:
+            target_tokens.append(PAD_TOKEN)
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
+            
+        for r_idx, row in enumerate(x):
+            # Add row elements
+            input_tokens.extend(row)
+            if flag:
+                target_tokens.extend([PAD_TOKEN]*len(row))
+            if NeedPosition:
+                row_len = len(row)
+                row_indices.extend([r_idx + global_r] * row_len)
+                col_indices.extend(list(range(global_c, row_len + global_c)))
+
+            input_tokens.append(LINE_BREAK)
+            if NeedPosition:
+                row_indices.append(0)
+                col_indices.append(0)
+            if flag:
+                target_tokens.append(PAD_TOKEN)
+
+        input_tokens.append(EOS_X)
+        if flag:
+            target_tokens.append(PAD_TOKEN)
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
+        
+        # Record input length if requested
+        if ReturnLengths:
+            output_start_pos = len(input_tokens)
+            input_length = output_start_pos - input_start_pos
+            lengths.append(input_length)
+
+        # separate out input and output grid    
+        global_r += offset1
+        global_c += offset1
+
+        # Process output grid (y)
+        input_tokens.append(BOS_Y)
+        if flag:
+            target_tokens.append(PAD_TOKEN)  # Mask BOS_Y
+        if NeedPosition:
+            row_indices.append(0)
+            col_indices.append(0)
+
+        if not IsLast:
+            for r_idx, row in enumerate(y):
+                # Add row elements
+                input_tokens.extend(row)
+                if flag:
+                    target_tokens.extend(row)  # Keep y values in target
+                if NeedPosition:
+                    # Extend position indices for the row
+                    row_len = len(row)
+                    row_indices.extend([r_idx + global_r] * row_len)
+                    col_indices.extend(list(range(global_c, row_len + global_c)))
+
+                input_tokens.append(LINE_BREAK)
+                if NeedPosition:
+                    row_indices.append(0)
+                    col_indices.append(0)                
+                if flag:
+                    target_tokens.append(LINE_BREAK)
+
+            input_tokens.append(EOS_Y)
+            if NeedPosition:
+                row_indices.append(0)
+                col_indices.append(0)
+            if flag:
+                target_tokens.append(EOS_Y)  # Include EOS_Y in target
+            
+            # Record output length if requested
+            if ReturnLengths:
+                output_length = len(input_tokens) - output_start_pos
+                lengths.append(output_length)
+            
+            # separate out different examples
+            global_r += offset2
+            global_c += offset2
+        else:
+            target_tokens = y  # For the last example in decode mode, we don't add output length
+        
+    # Create shifted targets (for next-token prediction)
+    if not IsDecode:
+        if autoregressive:
+            target_tokens = input_tokens[1:] + [PAD_TOKEN]
+        else:
+            target_tokens = target_tokens[1:] + [PAD_TOKEN]
+    
+    # Convert to numpy arrays
+    out = dict()
+    out["input_tokens"] = numpy2torch(input_tokens)
+    if IsDecode:
+        out["target_tokens"] = np.array(target_tokens) if target_tokens is not None else None
+    else:
+        out["target_tokens"] = numpy2torch(target_tokens)
+    if NeedPosition:
+        out["row_indices"] = numpy2torch(row_indices)[0]
+        out["col_indices"] = numpy2torch(col_indices)[0]
+    if ReturnLengths:
+        out["lengths"] = lengths
+    return out    
+
+def tokenize_causal_combined(task, max_length, IsDecode=False):
+    """
+    return example_ids, in_out_ids, position_ids (row_indices, col_indices), input_tokens to
+    be added together as input to the model.
+    
+    Args:
+        task (list): A list of tuples, where each tuple represents an example and
+                     contains (input_grid, output_grid). Each grid is a list of lists
+                     of integers (0-9). During decoding, the last tuple might be
+                     (test_input_grid, test_output_grid).
+        max_length (int): Maximum total sequence length (tokens) to consider from
+                          the examples. Examples exceeding this length when concatenated
+                          will be truncated by dropping early examples.
+        IsDecode (bool, optional): If True, tokenizes for decoding mode where the
+                                   last example's output is not included in input_tokens
+                                   but returned as target_tokens for evaluation.
+                                   If False, tokenizes for training mode with full
+                                   autoregressive targets. Defaults to False.
+    
+    Returns:
+        dict: A dictionary containing tokenized data with the following keys:
+            - "input_tokens" (torch.Tensor): Input token sequence of shape (seq_len,)
+            - "target_tokens" (torch.Tensor or np.array): Target tokens for training
+                                                          (torch.Tensor) or ground truth
+                                                          for decoding (np.array)
+            - "row_indices" (torch.Tensor): Row position indices of shape (seq_len,)
+            - "col_indices" (torch.Tensor): Column position indices of shape (seq_len,)
+            - "example_ids" (torch.Tensor): Example identifier indices of shape (seq_len,)
+                                            with random permutation to ensure variety
+            - "in_out_ids" (torch.Tensor): Input/output identifiers of shape (seq_len,)
+                                           where 0=input grid, 1=output grid
+    
+    Token Structure:
+        For each example: BOS_X, input_grid_rows, EOS_X, size_tokens, PREDICT_ROW,
+                         PREDICT_COL, BOS_Y, output_grid_rows, EOS_Y
+        
     """
     # Special token IDs
     BOS_X = 10  # Beginning of input grid
@@ -662,7 +842,10 @@ def tokenize_causal(task, max_length, IsDecode=False):
             row_indices.append(0)
             col_indices.append(0)
             target.append(EOS_Y)  # Include EOS_Y in target
-                
+            input_tokens.extend([OFFSET+n, OFFSET+m]) # add size as input tokens to help later size prediction
+            target.extend([PAD_TOKEN, PAD_TOKEN])
+            row_indices.extend([0, 0])
+            col_indices.extend([0, 0])
             # Extend example_ids and in_out_ids for entire output grid
             output_end_len = len(input_tokens)
             example_ids.extend([example_permutation[i]] * (output_end_len - output_start_len))
