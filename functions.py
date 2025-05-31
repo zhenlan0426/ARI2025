@@ -4,6 +4,7 @@ import numpy as np
 import random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from transformers import StaticCache
@@ -83,6 +84,8 @@ class GlobalConfig:
         return cls(**data)
     
 class CosSinEmbedding1D(nn.Module):
+    
+    @torch.no_grad()
     def __init__(self, dim=4096, theta=30):
         super().__init__()
         # For 1D embedding, theta represents the max_len (similar to 2D version)
@@ -100,7 +103,8 @@ class CosSinEmbedding1D(nn.Module):
         
         cos_sin = torch.cat([cos_embed, sin_embed], dim=-1)  # (theta, dim)
         self.register_buffer('cos_sin', cos_sin)
-        
+    
+    @torch.no_grad()
     def forward(self, positions):
         """
         Args:
@@ -135,6 +139,18 @@ class CosSinEmbedding2d(nn.Module):
             cols_cos_sin = self.cos_sin[cols]
         return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
 
+class MLPEmbedding(nn.Module):
+    def __init__(self, vocab_size=18, embed_dim=4096, hidden_dim=64):
+        super().__init__()
+        self.token_weight = nn.Parameter(torch.randn(vocab_size, embed_dim))
+        self.cos_sin_embedding = CosSinEmbedding1D(dim=embed_dim)
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(embed_dim, hidden_dim),torch.nn.SiLU(),torch.nn.Linear(hidden_dim,embed_dim))
+    
+    def forward(self, input_ids):
+        self.size_weights = self.mlp(self.cos_sin_embedding.cos_sin) / 14.7 # (30, embed_dim)
+        self.combined_weights = torch.cat([self.token_weight, self.size_weights], dim=0)        
+        return F.embedding(input_ids, self.combined_weights)
+    
 class CombinedEmbedding(nn.Module):
     def __init__(self, token_embedding_model, dim=4096, hidden_position=128, theta_1d=30, theta_2d=31):
         super().__init__()
