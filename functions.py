@@ -138,7 +138,64 @@ class CosSinEmbedding2d(nn.Module):
             rows_cos_sin = self.cos_sin[rows]
             cols_cos_sin = self.cos_sin[cols]
         return torch.cat([rows_cos_sin, cols_cos_sin], dim=1)[None,:] # (1, L, dim)
+    
+class BinarySizeEmbedding(nn.Module):
+    """
+    Embed integer sizes s ∈ [1..max_size] by their 5‐bit binary pattern:
+      s → (b_0, b_1, b_2, b_3, b_4),  LSB=b_0
+    size_emb(s) = sum_{i=0..4} b_i * E[i]
+    """
+    @torch.no_grad()
+    def __init__(self, max_size: int = 30, embed_dim: int = 4096):
+        super().__init__()
+        self.max_size = max_size
+        # number of bits needed to encode 0..max_size
+        max_bits = (max_size + 1).bit_length()   # here (30+1).bit_length() == 5
+        # one trainable vector per bit position
+        self.bit_vectors = nn.Parameter(torch.randn(max_bits, embed_dim)/56)
 
+        positions = torch.arange(1, self.max_size + 1).view(-1,1)
+        # bit_pos:            (1,bits) = [0,1,2,3,4]
+        bit_pos = torch.arange(max_bits).view(1, -1)
+        # shift & mask → bits: (B, bits) of 0/1
+        bits = ((positions >> bit_pos) & 1).to(torch.float32)
+        self.register_buffer('bits', bits)
+
+    def forward(self) -> torch.FloatTensor:
+        """
+        returns: (30, embed_dim)
+        """
+        # weighted sum → (B, bits) @ (bits, embed_dim) = (B, embed_dim)
+        return self.bits @ self.bit_vectors
+    
+class UnarySizeEmbedding(nn.Module):
+
+    def __init__(self, max_size: int = 30, embed_dim: int = 4096):
+        super().__init__()
+        self.max_size = max_size
+        self.bit_vectors = nn.Parameter(torch.randn(max_size, embed_dim)/56)
+
+    def forward(self) -> torch.FloatTensor:
+        """
+        returns: (30, embed_dim)
+        """
+        return torch.cumsum(self.bit_vectors, dim=0)
+
+    def get_L2_difference(self):
+        diff = self.bit_vectors[1:] - self.bit_vectors[:-1]
+        return diff.pow(2).mean()
+    
+class BinaryEmbedding(nn.Module):
+    def __init__(self, vocab_size=18, embed_dim=4096, embed_class=BinarySizeEmbedding):
+        super().__init__()
+        self.token_weight = nn.Parameter(torch.randn(vocab_size, embed_dim))
+        self.binary_embedding = embed_class()
+    
+    def forward(self, input_ids):
+        self.size_weights = self.binary_embedding() # (30, embed_dim)
+        self.combined_weights = torch.cat([self.token_weight, self.size_weights], dim=0)        
+        return F.embedding(input_ids, self.combined_weights)
+        
 class MLPEmbedding(nn.Module):
     def __init__(self, vocab_size=18, embed_dim=4096, hidden_dim=64):
         super().__init__()
