@@ -173,17 +173,18 @@ class UnarySizeEmbedding(nn.Module):
     def __init__(self, max_size: int = 30, embed_dim: int = 4096):
         super().__init__()
         self.max_size = max_size
-        self.bit_vectors = nn.Parameter(torch.randn(max_size, embed_dim)/56)
+        self.bit_vectors = nn.Parameter(torch.randn(max_size, embed_dim)/40)
+        self.register_buffer('norm_factor', torch.sqrt(torch.arange(1, self.max_size + 1)[:, None]))
 
     def forward(self) -> torch.FloatTensor:
         """
         returns: (30, embed_dim)
         """
-        return torch.cumsum(self.bit_vectors, dim=0)
+        return torch.cumsum(self.bit_vectors, dim=0)/self.norm_factor
 
     def get_L2_difference(self):
         diff = self.bit_vectors[1:] - self.bit_vectors[:-1]
-        return diff.pow(2).mean()
+        return diff.pow(2).mean().sqrt()
     
 class BinaryEmbedding(nn.Module):
     def __init__(self, vocab_size=18, embed_dim=4096, embed_class=BinarySizeEmbedding):
