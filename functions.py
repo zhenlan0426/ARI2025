@@ -950,6 +950,196 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
     out["in_out_ids"] = numpy2torch(in_out_ids)[0]
     return out
 
+def tokenize_causal_combined2(task, max_length, IsDecode=False):
+    """
+    instead of using special tokens to predict grid size, predict autoregressively
+    
+    Args:
+        task (list): A list of tuples, where each tuple represents an example and
+                     contains (input_grid, output_grid). Each grid is a list of lists
+                     of integers (0-9). During decoding, the last tuple might be
+                     (test_input_grid, test_output_grid).
+        max_length (int): Maximum total sequence length (tokens) to consider from
+                          the examples. Examples exceeding this length when concatenated
+                          will be truncated by dropping early examples.
+        IsDecode (bool, optional): If True, tokenizes for decoding mode where the
+                                   last example's output is not included in input_tokens
+                                   but returned as target_tokens for evaluation.
+                                   If False, tokenizes for training mode with full
+                                   autoregressive targets. Defaults to False.
+    
+    Returns:
+        dict: A dictionary containing tokenized data with the following keys:
+            - "input_tokens" (torch.Tensor): Input token sequence of shape (seq_len,)
+            - "target_tokens" (torch.Tensor or np.array): Target tokens for training
+                                                          (torch.Tensor) or ground truth
+                                                          for decoding (np.array)
+            - "row_indices" (torch.Tensor): Row position indices of shape (seq_len,)
+            - "col_indices" (torch.Tensor): Column position indices of shape (seq_len,)
+            - "example_ids" (torch.Tensor): Example identifier indices of shape (seq_len,)
+                                            with random permutation to ensure variety
+            - "in_out_ids" (torch.Tensor): Input/output identifiers of shape (seq_len,)
+                                           where 0=input grid, 1=output grid
+            - "size_mask" (torch.Tensor): Mask indicating size prediction tokens (1) vs content tokens (0)
+    
+    Token Structure:
+        For each example: BOS_X, size_info, input_grid_rows, EOS_X, BOS_Y, size_info, output_grid_rows, EOS_Y
+        Size info format: row_digit_tokens + SEPARATOR + col_digit_tokens + SEPARATOR
+        Digits 0-9 are represented by tokens 18-27, separator is token 28
+        
+    """
+    # Special token IDs
+    BOS_X = 10  # Beginning of input grid
+    EOS_X = 11  # End of input grid
+    LINE_BREAK = 12  # Row separator
+    BOS_Y = 13  # Beginning of output grid
+    EOS_Y = 14  # End of output grid
+    # Removed PREDICT_ROW = 15 and PREDICT_COL = 16
+    PREDICT_CELL = 17 # for one-shot prediction, not used in initial training
+    # Tokens 18-27 represent digits 0-9
+    DIGIT_OFFSET = 18  # digit 0 -> token 18, digit 1 -> token 19, etc.
+    SEPARATOR = 28  # Separator between row and col size
+    PAD_TOKEN = -100  # Padding/ignored token
+
+    def number_to_digit_tokens(num):
+        """Convert a number to a list of digit tokens."""
+        digit_tokens = []
+        for digit_char in str(num):
+            digit = int(digit_char)
+            digit_tokens.append(DIGIT_OFFSET + digit)
+        return digit_tokens
+
+    input_tokens = []
+    target_tokens = []
+    row_indices = []
+    col_indices = []
+    example_ids = []
+    in_out_ids = []
+    size_mask = []  # 1 for size prediction tokens, 0 for content tokens
+    
+    n_task = find_first_exceed(task, max_length)
+    if IsDecode:
+        # For decoding, must include the last task
+        task = task[:n_task-1] + [task[-1]] 
+    else:
+        task = task[:n_task]
+    n = len(task)
+    global_r, global_c = 1, 1  # special token has (0,0). So we start from 1 to differentiate special token.
+    example_permutation = np.random.permutation(30)
+    for i, (x, y) in enumerate(task):
+        IsLast = (i == n-1) and IsDecode
+        
+        # Process input grid (x)
+        target = []
+        input_start_len = len(input_tokens)
+        input_tokens.append(BOS_X)
+        target.append(PAD_TOKEN)
+        row_indices.append(0)
+        col_indices.append(0)
+        size_mask.append(1)  # BOS_X is part of size prediction
+        
+        # Add size information right after BOS_X
+        n, m = len(x), len(x[0])
+        size_tokens = number_to_digit_tokens(n) + [SEPARATOR] + number_to_digit_tokens(m) + [SEPARATOR]
+        input_tokens.extend(size_tokens)
+        target.extend(size_tokens)
+        row_indices.extend([0] * len(size_tokens))
+        col_indices.extend([0] * len(size_tokens))
+        size_mask.extend([1] * (len(size_tokens) - 1))  # last token is to predict first content token
+        size_mask.append(0)
+            
+        for r_idx, row in enumerate(x):
+            # Add row elements
+            input_tokens.extend(row)
+            target.extend(row)
+            row_len = len(row)
+            row_indices.extend([r_idx + global_r] * row_len)
+            col_indices.extend(list(range(global_c, row_len + global_c)))
+            size_mask.extend([0] * row_len)  # Content tokens
+
+            input_tokens.append(LINE_BREAK)
+            row_indices.append(r_idx + global_r + 1)
+            col_indices.append(0)
+            target.append(LINE_BREAK)
+            size_mask.append(0)  # LINE_BREAK is content token
+
+        input_tokens.append(EOS_X)
+        target.append(EOS_X)
+        row_indices.append(0)
+        col_indices.append(0)
+        size_mask.append(0)  # EOS_X is content token
+
+        # Extend example_ids and in_out_ids for entire input grid
+        input_end_len = len(input_tokens)
+        example_ids.extend([example_permutation[i]] * (input_end_len - input_start_len))
+        in_out_ids.extend([0] * (input_end_len - input_start_len))  # 0 for input
+        
+        target.append(PAD_TOKEN)
+        target_tokens.extend(target[1:]) # shift by 1 for autoregressive target
+        
+        # Process output grid (y)
+        output_start_len = len(input_tokens)
+        n, m = len(y), len(y[0])
+        target = [PAD_TOKEN]  # For BOS_Y
+        input_tokens.append(BOS_Y)
+        row_indices.append(0)
+        col_indices.append(0)
+        size_mask.append(1)  # BOS_Y is part of size prediction
+        
+        # Add size information right after BOS_Y
+        size_tokens = number_to_digit_tokens(n) + [SEPARATOR] + number_to_digit_tokens(m) + [SEPARATOR]
+        input_tokens.extend(size_tokens)
+        target.extend(size_tokens)
+        row_indices.extend([0] * len(size_tokens))
+        col_indices.extend([0] * len(size_tokens))
+        size_mask.extend([1] * (len(size_tokens) - 1))  # last token is to predict first content token
+        size_mask.append(0)
+
+        if not IsLast:
+            for r_idx, row in enumerate(y):
+                # Add row elements
+                input_tokens.extend(row)
+                target.extend(row)  # Keep y values in target
+                # Extend position indices for the row
+                row_len = len(row)
+                row_indices.extend([r_idx + global_r] * row_len)
+                col_indices.extend(list(range(global_c, row_len + global_c)))
+                size_mask.extend([0] * row_len)  # Content tokens
+
+                input_tokens.append(LINE_BREAK)
+                row_indices.append(r_idx + global_r + 1)
+                col_indices.append(0)                
+                target.append(LINE_BREAK)
+                size_mask.append(0)  # LINE_BREAK is content token
+
+            input_tokens.append(EOS_Y)
+            row_indices.append(0)
+            col_indices.append(0)
+            target.append(EOS_Y)  # Include EOS_Y in target
+            size_mask.append(0)  # EOS_Y is content token
+            
+            # Extend example_ids and in_out_ids for entire output grid
+            output_end_len = len(input_tokens)
+            example_ids.extend([example_permutation[i]] * (output_end_len - output_start_len))
+            in_out_ids.extend([1] * (output_end_len - output_start_len))  # 1 for output
+            target.append(PAD_TOKEN)
+            target_tokens.extend(target[1:]) # shift by 1 for autoregressive target
+        else:
+            target_tokens = y  # For the last example in decode mode
+    # Convert to numpy arrays
+    out = dict()
+    out["input_tokens"] = numpy2torch(input_tokens)
+    if IsDecode:
+        out["target_tokens"] = np.array(target_tokens) if target_tokens is not None else None
+    else:
+        out["target_tokens"] = numpy2torch(target_tokens)
+    out["row_indices"] = numpy2torch(row_indices)[0]
+    out["col_indices"] = numpy2torch(col_indices)[0]
+    out["example_ids"] = numpy2torch(example_ids)[0]
+    out["in_out_ids"] = numpy2torch(in_out_ids)[0]
+    out["size_mask"] = torch.tensor(size_mask, dtype=torch.bool).to('cuda')
+    return out
+
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
                      max_length:int,\
                      IsDecode:bool, autoregressive:bool, NeedPosition:bool=False):
