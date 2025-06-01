@@ -167,9 +167,18 @@ class BinarySizeEmbedding(nn.Module):
         """
         # weighted sum → (B, bits) @ (bits, embed_dim) = (B, embed_dim)
         return self.bits @ self.bit_vectors
-    
-class UnarySizeEmbedding(nn.Module):
 
+class LinearSizeEmbedding(nn.Module):
+    def __init__(self, max_size: int = 30, embed_dim: int = 4096):
+        super().__init__()
+        self.bias = nn.Parameter(torch.randn(1, embed_dim)/40)
+        self.scale = nn.Parameter(torch.randn(1, embed_dim)/40)
+        self.register_buffer('range', torch.arange(max_size)[:, None])
+
+    def forward(self) -> torch.FloatTensor:
+        return self.bias + self.scale * self.range
+
+class UnarySizeEmbedding(nn.Module):
     def __init__(self, max_size: int = 30, embed_dim: int = 4096):
         super().__init__()
         self.max_size = max_size
