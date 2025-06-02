@@ -183,14 +183,14 @@ class UnarySizeEmbedding(nn.Module):
         super().__init__()
         self.max_size = max_size
         self.bit_vectors = nn.Parameter(torch.randn(max_size, embed_dim)/40)
-        self.register_buffer('norm_factor', torch.sqrt(torch.arange(1, self.max_size + 1)[:, None]))
+        # self.register_buffer('norm_factor', torch.sqrt(torch.arange(1, self.max_size + 1)[:, None]))
 
     def forward(self) -> torch.FloatTensor:
         """
         returns: (30, embed_dim)
         """
-        return torch.cumsum(self.bit_vectors, dim=0)/self.norm_factor
-
+        # return torch.cumsum(self.bit_vectors, dim=0)/self.norm_factor
+        return torch.cumsum(self.bit_vectors, dim=0)
     def get_L2_difference(self):
         diff = self.bit_vectors[1:] - self.bit_vectors[:-1]
         return diff.pow(2).mean().sqrt()
@@ -232,11 +232,15 @@ class CombinedEmbedding(nn.Module):
         self.position_embedding_model = CosSinEmbedding2d(theta=theta_2d)
         self.example_embedding_model.weight.data.normal_(0, 0.01)
         self.in_out_id_model.weight.data.normal_(0, 0.01)
+        self.oneshot_token = nn.Parameter(torch.randn(1, 1, dim)/40)
         # self.norm = Qwen3RMSNorm(dim)
         # self.dropout = nn.Dropout(dropout)
 
-    def forward(self, inputs):
-        token_embedding = self.token_embedding_model(inputs['input_tokens'])
+    def forward(self, inputs, include_token_embedding=True):
+        if include_token_embedding:
+            token_embedding = self.token_embedding_model(inputs['input_tokens'])
+        else:
+            token_embedding = self.oneshot_token
         example_embedding = self.example_embedding_model(inputs['example_ids'])
         in_out_embedding = self.in_out_id_model(inputs['in_out_ids'])[None]
         pos_embedding = self.position_MLP(self.position_embedding_model(inputs['row_indices'], inputs['col_indices']))
@@ -823,6 +827,8 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
                                             with random permutation to ensure variety
             - "in_out_ids" (torch.Tensor): Input/output identifiers of shape (seq_len,)
                                            where 0=input grid, 1=output grid
+            - "last_output_start_idx" (int): Index where last example's output starts (-1 if not in input_tokens)
+            - "has_size_changes" (bool): True if any example has different input/output dimensions
     
     Token Structure:
         For each example: BOS_X, input_grid_rows, EOS_X, size_tokens, PREDICT_ROW,
@@ -858,8 +864,17 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
     n = len(task)
     global_r, global_c = 1, 1  # special token has (0,0). So we start from 1 to differentiate special token.
     example_permutation = np.random.permutation(30)
+    
+    # Track additional return values
+    last_output_start_idx = -1
+    has_size_changes = False
+    
     for i, (x, y) in enumerate(task):
         IsLast = (i == n-1) and IsDecode
+        
+        # Check for size changes
+        if len(x) != len(y) or len(x[0]) != len(y[0]):
+            has_size_changes = True
         
         # Process input grid (x)
         target = []
@@ -900,6 +915,9 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
         
         # Process output grid (y)
         output_start_len = len(input_tokens)
+        # Track last example's output start index
+        last_output_start_idx = output_start_len
+        
         n,m = len(y), len(y[0])
         target = [PAD_TOKEN, n-1, m-1] # 0-indexed size prediction, logit[:, :, 18:] 18 <-> 0, 19 <-> 1,...
         input_tokens.extend([PREDICT_ROW, PREDICT_COL, BOS_Y])
@@ -948,6 +966,8 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
     out["col_indices"] = numpy2torch(col_indices)[0]
     out["example_ids"] = numpy2torch(example_ids)[0]
     out["in_out_ids"] = numpy2torch(in_out_ids)[0]
+    out["last_output_start_idx"] = last_output_start_idx
+    out["has_size_changes"] = has_size_changes
     return out
 
 def tokenize_causal_combined2(task, max_length, IsDecode=False):
@@ -981,6 +1001,8 @@ def tokenize_causal_combined2(task, max_length, IsDecode=False):
             - "in_out_ids" (torch.Tensor): Input/output identifiers of shape (seq_len,)
                                            where 0=input grid, 1=output grid
             - "size_mask" (torch.Tensor): Mask indicating size prediction tokens (1) vs content tokens (0)
+            - "last_output_start_idx" (int): Index where last example's output starts (-1 if not in input_tokens)
+            - "has_size_changes" (bool): True if any example has different input/output dimensions
     
     Token Structure:
         For each example: BOS_X, size_info, input_grid_rows, EOS_X, BOS_Y, size_info, output_grid_rows, EOS_Y
@@ -1026,8 +1048,17 @@ def tokenize_causal_combined2(task, max_length, IsDecode=False):
     n = len(task)
     global_r, global_c = 1, 1  # special token has (0,0). So we start from 1 to differentiate special token.
     example_permutation = np.random.permutation(30)
+    
+    # Track additional return values
+    last_output_start_idx = -1
+    has_size_changes = False
+    
     for i, (x, y) in enumerate(task):
         IsLast = (i == n-1) and IsDecode
+        
+        # Check for size changes
+        if len(x) != len(y) or len(x[0]) != len(y[0]):
+            has_size_changes = True
         
         # Process input grid (x)
         target = []
@@ -1079,6 +1110,9 @@ def tokenize_causal_combined2(task, max_length, IsDecode=False):
         
         # Process output grid (y)
         output_start_len = len(input_tokens)
+        # Track last example's output start index
+        last_output_start_idx = output_start_len
+        
         n, m = len(y), len(y[0])
         target = [PAD_TOKEN]  # For BOS_Y
         input_tokens.append(BOS_Y)
@@ -1138,6 +1172,8 @@ def tokenize_causal_combined2(task, max_length, IsDecode=False):
     out["example_ids"] = numpy2torch(example_ids)[0]
     out["in_out_ids"] = numpy2torch(in_out_ids)[0]
     out["size_mask"] = torch.tensor(size_mask, dtype=torch.bool).to('cuda')
+    out["last_output_start_idx"] = last_output_start_idx
+    out["has_size_changes"] = has_size_changes
     return out
 
 def tokenize_oneshot(task:list[tuple[list[list[int]], list[list[int]]]], \
