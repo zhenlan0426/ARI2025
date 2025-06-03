@@ -140,3 +140,30 @@ structure (line break, EOS_X, EOS_Y, BOS_X, BOS_Y are the only ways in theory to
    example_permutation = np.random.permutation(30)
    example_ids.extend([example_permutation[i]] * (input_end_len - input_start_len))    
    ```
+
+#### Grid size prediction
+- as separate training target. needed for one-shot outputN prediction (independent instead of autoregressive)
+- 60% training problem has no size change between input and output.
+- Conceptually, human first infer the size of the grid and then fill in the grid.
+- either use special PRED_ROW and PRED_COL token or predict autoregressively, 
+   - BOS_X, input_grid_rows, EOS_X, size_tokens for X, PREDICT_ROW, PREDICT_COL, BOS_Y, output_grid_rows, size_tokens for Y, EOS_Y. Size tokens and target token for PRED_ROW and PRED_COL are the same.
+   - BOS_X, size_info, input_grid_rows, EOS_X, BOS_Y, size_info, output_grid_rows, EOS_Y
+- Size representation
+   - use separate embedding for size_info 1 ~ 30 (no info sharing, model needs to learn multiplicative / additive relationship from scratch)
+   - size (1 ~ 30) -> cos / sin embedding -> MLP (used as embedding) - **MLPEmbedding**
+   - use binary to represent size_info (1 ~ 30) -> 5 bits (one embedding vector for each bit) -> add the cooresponding bit embedding vector to represent size. **BinaryEmbedding**
+   - use unary to represent size_info (1 ~ 30) -> 30 bits (one embedding vector for each bit) -> cumsum the embedding vectors up to the size to represent size. **UnaryEmbedding**
+   - use pretrained embedding digit (0 ~ 9) to represent size_info with the hope that model can reuse the multiplicative / additive relationship learned from pretrain. 
+   This is like subword tokenization as we can have more than one token for numbers greater than 9. So per token cross-entropy loss looks better. Fair performance comparison
+   would be to compare generation correctness.
+   - row #, col # can be made into one "word" (30 * 30 possible values), maybe shared representation as the position embedding in input representation. Again, per token cross-entropy loss looks different (worse).
+- Performance is unsatisfactory for all size representation. Need to explore model architecture level changes. Right now, size prediction and content prediction have separate heads
+by calculating logits separately.
+   ```
+   size_weight = size_embedding_model.size_weights.T # (4096, 30)
+   cell_weight = size_embedding_model.token_weight[:15].T # (4096, 15), predict 0 ~ 9, LINE_BREAK, BOS_X, EOS_X, BOS_Y, EOS_Y  
+   yhat1 = out[0, mask] @ size_weight
+   yhat2 = out[0, ~mask] @ cell_weight # cell prediction
+   ```
+
+
