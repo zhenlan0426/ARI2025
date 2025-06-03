@@ -1,5 +1,5 @@
 ### ARI2025 - ARC
-Problem: To solve ARC AGI problem using VLM. each task is represented as (input1, output1),(input2, output2),... (inputN, outputN), where input and output are 2d grid of integer between 0 and 9. Our goal is to given all history up till inputN, and predict outputN.
+Problem: To solve ARC AGI problem using LLM. each task is represented as (input1, output1),(input2, output2),... (inputN, outputN), where input and output are 2d grid of integer between 0 and 9. Our goal is to given all history up till inputN, and predict outputN.
 #### Custom attention mask
 1. Based on Fine_Tune copy 2, 3, 5. mask does not seem to matter. branch off from functions_old
 2. BOS_Y -> row -> col does not work well as model predict row and then proceed to predict cell 1 as shown in
@@ -129,3 +129,14 @@ input_tokens: BOS_X, placeholder_token * flattened sequence length, EOS_X, BOS_Y
 #### Model Target
 - autoregressive on all (all causal) -> autoregressive on output (input non-causal, output causal) -> autoregressive on outputN / one-shot on outputN
 - less training signal as we autoregressively train on less target but with richer features. **one-shot on outputN does not work well and size prediction does not work well as shown in Fine_Tune copy 19**
+
+#### Input representation
+- Conceptually, the problem is of dimension (example_count, input / output, height, width, color_channel) and we flatten the first 4 dimensions for llm to process. The flattened input loses the original
+structure (line break, EOS_X, EOS_Y, BOS_X, BOS_Y are the only ways in theory to recover the original structure for the llm).
+- might be easier to explicitly represent the input as sum of example_id, input / output, position_id (row, col) and color_channel.
+- Implemented in CombinedEmbedding
+- Randomly permute example_id, to ensure all ids are trained and what exact example_id is not important but different ids are to be treated as different examples.
+   ```python
+   example_permutation = np.random.permutation(30)
+   example_ids.extend([example_permutation[i]] * (input_end_len - input_start_len))    
+   ```
