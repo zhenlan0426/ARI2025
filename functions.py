@@ -796,7 +796,7 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
         out["lengths"] = lengths
     return out    
 
-def tokenize_causal_combined(task, max_length, IsDecode=False):
+def tokenize_causal_combined(task, max_length, IsDecode=False, include_size_tokens=True):
     """
     return example_ids, in_out_ids, position_ids (row_indices, col_indices), input_tokens to
     be added together as input to the model.
@@ -814,6 +814,10 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
                                    but returned as target_tokens for evaluation.
                                    If False, tokenizes for training mode with full
                                    autoregressive targets. Defaults to False.
+        include_size_tokens (bool, optional): If True, includes size_tokens_X, 
+                                              PREDICT_ROW, PREDICT_COL, and size_tokens_Y.
+                                              If False, excludes these tokens.
+                                              Defaults to True.
     
     Returns:
         dict: A dictionary containing tokenized data with the following keys:
@@ -831,8 +835,11 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
             - "has_size_changes" (bool): True if any example has different input/output dimensions
     
     Token Structure:
-        For each example: BOS_X, input_grid_rows, EOS_X, size_tokens, PREDICT_ROW,
-                         PREDICT_COL, BOS_Y, output_grid_rows, EOS_Y
+        For each example (when include_size_tokens=True): 
+            BOS_X, input_grid_rows, EOS_X, size_tokens_X, PREDICT_ROW,
+            PREDICT_COL, BOS_Y, output_grid_rows, EOS_Y, size_tokens_Y
+        For each example (when include_size_tokens=False):
+            BOS_X, input_grid_rows, EOS_X, BOS_Y, output_grid_rows, EOS_Y
         
     """
     # Special token IDs
@@ -899,11 +906,15 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
 
         input_tokens.append(EOS_X)
         target.append(EOS_X)
-        row_indices.extend([0, 0, 0])
-        col_indices.extend([0, 0, 0])
-        n,m = len(x), len(x[0])
-        input_tokens.extend([OFFSET+n, OFFSET+m])
-        target.extend([PAD_TOKEN, PAD_TOKEN])
+        row_indices.append(0)
+        col_indices.append(0)
+        
+        if include_size_tokens:
+            n,m = len(x), len(x[0])
+            input_tokens.extend([OFFSET+n, OFFSET+m])
+            target.extend([PAD_TOKEN, PAD_TOKEN])
+            row_indices.extend([0, 0])
+            col_indices.extend([0, 0])
 
         # Extend example_ids and in_out_ids for entire input grid
         input_end_len = len(input_tokens)
@@ -918,11 +929,17 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
         # Track last example's output start index
         last_output_start_idx = output_start_len
         
-        n,m = len(y), len(y[0])
-        target = [PAD_TOKEN, n-1, m-1] # 0-indexed size prediction, logit[:, :, 18:] 18 <-> 0, 19 <-> 1,...
-        input_tokens.extend([PREDICT_ROW, PREDICT_COL, BOS_Y])
-        row_indices.extend([0, 0, 0])
-        col_indices.extend([0, 0, 0])
+        if include_size_tokens:
+            n,m = len(y), len(y[0])
+            target = [PAD_TOKEN, n-1, m-1] # 0-indexed size prediction, logit[:, :, 18:] 18 <-> 0, 19 <-> 1,...
+            input_tokens.extend([PREDICT_ROW, PREDICT_COL, BOS_Y])
+            row_indices.extend([0, 0, 0])
+            col_indices.extend([0, 0, 0])
+        else:
+            target = [PAD_TOKEN]
+            input_tokens.append(BOS_Y)
+            row_indices.append(0)
+            col_indices.append(0)
 
         if not IsLast:
             for r_idx, row in enumerate(y):
@@ -943,10 +960,11 @@ def tokenize_causal_combined(task, max_length, IsDecode=False):
             row_indices.append(0)
             col_indices.append(0)
             target.append(EOS_Y)  # Include EOS_Y in target
-            input_tokens.extend([OFFSET+n, OFFSET+m]) # add size as input tokens to help later size prediction
-            target.extend([PAD_TOKEN, PAD_TOKEN])
-            row_indices.extend([0, 0])
-            col_indices.extend([0, 0])
+            if include_size_tokens:
+                input_tokens.extend([OFFSET+n, OFFSET+m]) # add size as input tokens to help later size prediction
+                target.extend([PAD_TOKEN, PAD_TOKEN])
+                row_indices.extend([0, 0])
+                col_indices.extend([0, 0])
             # Extend example_ids and in_out_ids for entire output grid
             output_end_len = len(input_tokens)
             example_ids.extend([example_permutation[i]] * (output_end_len - output_start_len))
