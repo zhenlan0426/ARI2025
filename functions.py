@@ -794,7 +794,38 @@ def tokenize_causal(task, autoregressive: bool, max_length, IsDecode=False, Need
         out["col_indices"] = numpy2torch(col_indices)[0]
     if ReturnLengths:
         out["lengths"] = lengths
-    return out    
+    return out
+
+def tokenize_by_example(task, last_k=1):
+    # Special token IDs
+    BOS_X = 10  # Beginning of input grid
+    EOS_X = 11  # End of input grid
+    LINE_BREAK = 12  # Row separator
+    BOS_Y = 13  # Beginning of output grid
+    EOS_Y = list(range(14, 14+last_k))  # End of output grid
+    PAD_TOKEN = -100  # Padding/ignored token
+    input_tokens_list = []
+
+    def get_token_from_grid(grid, bos_token, eos_token, line_break_token):
+        tokens = [bos_token]
+        for row in grid:
+            tokens.extend(row)
+            tokens.append(line_break_token)
+        if isinstance(eos_token, list):
+            tokens.extend(eos_token)
+        else:
+            tokens.append(eos_token)
+        return tokens
+    for x, y in task:
+        input_tokens = get_token_from_grid(x, BOS_X, EOS_X, LINE_BREAK)
+        if y is not None:
+            output_tokens = get_token_from_grid(y, BOS_Y, EOS_Y, LINE_BREAK)
+            input_tokens.extend(output_tokens)
+        else:
+            input_tokens.append(BOS_Y)
+        input_tokens_list.append(numpy2torch(input_tokens))
+    return input_tokens_list, y if y is None else np.array(y)
+
 
 def tokenize_causal_combined(task, max_length, IsDecode=False, include_size_tokens=True):
     """

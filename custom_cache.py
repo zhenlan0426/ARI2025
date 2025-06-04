@@ -9,11 +9,13 @@ class LastPositionCache(Cache):
     but only stores the last position of the current KV states in its internal cache.
     """
     
-    def __init__(self):
+    def __init__(self, last_k=1):
         super().__init__()
         self.key_cache: List[Optional[torch.Tensor]] = []
         self.value_cache: List[Optional[torch.Tensor]] = []
-    
+        self._seq_length = 0  # Track total sequence length seen so far
+        self.last_k = last_k
+
     def update(
         self, 
         key_states: torch.Tensor, 
@@ -33,6 +35,10 @@ class LastPositionCache(Cache):
         Returns:
             Tuple of (concatenated_keys, concatenated_values) for attention computation
         """
+        # Update sequence length only for the first layer (to avoid counting multiple times)
+        if layer_idx == 0:
+            self._seq_length += key_states.shape[-2]
+        
         # Ensure we have enough layers in our cache
         while len(self.key_cache) <= layer_idx:
             self.key_cache.append(None)
@@ -54,7 +60,16 @@ class LastPositionCache(Cache):
         
         # Store only the LAST position of current KV in cache
         # Extract the last position from current key_states and value_states
-        self.key_cache[layer_idx] = key_states[..., -1:, :]  # Shape: [batch, heads, 1, head_dim]
-        self.value_cache[layer_idx] = value_states[..., -1:, :]  # Shape: [batch, heads, 1, head_dim]
+        self.key_cache[layer_idx] = key_states[..., -self.last_k:, :]  # Shape: [batch, heads, 1, head_dim]
+        self.value_cache[layer_idx] = value_states[..., -self.last_k:, :]  # Shape: [batch, heads, 1, head_dim]
         
         return full_keys, full_values
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states."""
+        return self._seq_length
+    
+    # def get_max_cache_shape(self) -> Optional[int]:
+    #     """Returns the maximum sequence length of the cache object."""
+    #     # Since we're only storing the last position, there's no inherent max limit
+    #     return None
